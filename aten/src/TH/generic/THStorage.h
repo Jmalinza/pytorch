@@ -35,13 +35,13 @@
 #define THLongStorage THStorage
 #define THBoolStorage THStorage
 
-TH_API scalar_t* THStorage_(data)(const THStorage*);
+TH_API scalar_t* THStorage_(data)(THStorage*);
 TH_API ptrdiff_t THStorage_(size)(const THStorage*);
 TH_API size_t THStorage_(elementSize)(void);
 
 /* slow access -- checks everything */
 TH_API void THStorage_(set)(THStorage*, ptrdiff_t, scalar_t);
-TH_API scalar_t THStorage_(get)(const THStorage*, ptrdiff_t);
+TH_API scalar_t THStorage_(get)(THStorage*, ptrdiff_t);
 
 TH_API THStorage* THStorage_(new)(void);
 TH_API THStorage* THStorage_(newWithSize)(ptrdiff_t size);

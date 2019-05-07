@@ -2,6 +2,7 @@
 
 #include <c10/core/Allocator.h>
 #include <c10/core/ScalarType.h>
+#include <c10/core/LargeModelSupport.h>
 
 #include <c10/util/intrusive_ptr.h>
 
@@ -20,7 +21,8 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
         numel_(numel),
         resizable_(resizable),
         received_cuda_(false),
-        allocator_(allocator) {
+        allocator_(allocator),
+        lms_(allocator ? allocator->lms() : nullptr) {
     if (resizable) {
       AT_ASSERTM(
           allocator_, "For resizable storage, allocator must be provided");
@@ -55,6 +57,7 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
   void reset() {
     data_ptr_.clear();
     numel_ = 0;
+    lms_.unset();
   }
 
   template <typename T>
@@ -63,7 +66,7 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
   }
 
   template <typename T>
-  inline T* data() const {
+  inline T* data() {
     auto data_type = caffe2::TypeMeta::Make<T>();
     if (dtype() != data_type) {
       AT_ERROR(
@@ -76,12 +79,14 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
   }
 
   template <typename T>
-  inline T* unsafe_data() const {
+  inline T* unsafe_data() {
+    lms_ensure_data();
     return static_cast<T*>(this->data_ptr_.get());
   }
 
   void release_resources() override {
     data_ptr_.clear();
+    lms_.release_resources();
   }
 
   size_t itemsize() const {
@@ -106,10 +111,7 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
   };
 
   at::DataPtr& data_ptr() {
-    return data_ptr_;
-  };
-
-  const at::DataPtr& data_ptr() const {
+    lms_ensure_data();
     return data_ptr_;
   };
 
@@ -130,10 +132,7 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
 
   // TODO: Return const ptr eventually if possible
   void* data() {
-    return data_ptr_.get();
-  }
-
-  void* data() const {
+    lms_ensure_data();
     return data_ptr_.get();
   }
 
@@ -209,6 +208,7 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
     numel_ = capacity / data_type_.itemsize();
     allocator_ = nullptr;
     resizable_ = false;
+    lms_.unset();
   }
 
   // This method can be used only after storage construction and cannot be used
@@ -221,7 +221,58 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
     return received_cuda_;
   }
 
+  // Large Model Support
+  bool lms_enabled() const                  { return lms_.enabled(); }
+  bool lms_reclaimed() const                { return lms_.reclaimed(); }
+  void lms_release_resources()              { lms_.release_resources(); }
+  void lms_list_add(IntrusiveList* list)    { lms_.list_add(list); }
+  bool lms_list_remove()                    { return lms_.list_remove(); }
+  void* allocation_ptr() const              { return data_ptr_.get(); }
+  static StorageImpl* from_list_hook(IntrusiveListHook *hook);
+
+  bool lms_pin() {
+    bool initial = lms_.pin();
+    if (initial && lms_reclaimed()) {
+      lms_pagein();
+    }
+    return initial;
+  }
+
+  bool lms_unpin() {
+    bool final = lms_.unpin();
+    return final;
+  }
+
+  void lms_pageout(LMSSyncEvent_t sync_event, IntrusiveList *async_queue = nullptr) {
+    lms_.pageout(data_ptr_.get(), capacity(), sync_event, async_queue);
+  }
+
+  void lms_pageout_sync(IntrusiveList *async_queue = nullptr) {
+    lms_.pageout_sync(async_queue);
+    set_data_ptr(at::DataPtr(nullptr, device()));
+  }
+
+  void lms_copy_reclaimed_data(void* dst, size_t size) {
+    lms_.copy_reclaimed_data(dst, size);
+  }
+
  private:
+  void lms_pagein() {
+    AT_ASSERT(!data_ptr_);
+    size_t size = capacity();
+    set_data_ptr(allocator()->allocate(size));
+    lms_.pagein(data_ptr_.get(), size);
+  }
+
+  void lms_ensure_data() {
+    if (!lms_enabled() || lms_.reclaim_list_remove() || !lms_reclaimed())
+      return;
+
+    if (!data_ptr_)
+      lms_pagein();
+    lms_.pagein_sync();
+  }
+
   caffe2::TypeMeta data_type_;
   DataPtr data_ptr_;
   int64_t numel_;
@@ -230,5 +281,6 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
   // local to process cuda memory allocation
   bool received_cuda_;
   Allocator* allocator_;
+  LMS lms_;
 };
 } // namespace c10

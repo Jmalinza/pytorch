@@ -12,6 +12,7 @@ $storage_tensor_headers
 #include <ATen/${Generator}.h>
 #include <c10/core/Allocator.h>
 #include <ATen/DeviceGuard.h>
+#include <ATen/TensorGuard.h>
 #include <ATen/NativeFunctions.h>
 #include <ATen/Utils.h>
 #include <ATen/WrapDimUtils.h>

@@ -56,10 +56,10 @@ struct C10_API Storage {
   }
 
   template <typename T>
-  T* data() const { return storage_impl_->data<T>(); }
+  T* data() const { return storage_impl_.get()->data<T>(); }
 
   template <typename T>
-  T* unsafe_data() const { return storage_impl_->unsafe_data<T>(); }
+  T* unsafe_data() const { return storage_impl_.get()->unsafe_data<T>(); }
 
   size_t elementSize() const {
     return storage_impl_->itemsize();
@@ -104,7 +104,7 @@ struct C10_API Storage {
   }
 
   const at::DataPtr& data_ptr() const {
-    return storage_impl_->data_ptr();
+    return storage_impl_.get()->data_ptr();
   }
 
   // Returns the previous data_ptr

@@ -2803,6 +2803,105 @@ class TestCuda(TestCase):
             torch.DoubleTensor(a).cuda().round().cpu(),
             torch.DoubleTensor(res).cpu())
 
+    def test_large_model_support(self):
+        device = torch.cuda.current_device()
+        default_enabled = torch.cuda.get_enabled_lms()
+        default_size = torch.cuda.get_size_lms()
+        default_limit = torch.cuda.get_limit_lms()
+
+        def alloc(*size):
+            with torch.cuda.device(device):
+                return torch.cuda.FloatTensor(*size).normal_()
+
+        # 1. Test Inactive LMS Off
+        #    LMS Off / alloc multiple small and large
+        #    assert(active memory == allocated memory)
+        # 2. Test Inactive LMS On
+        #    LMS On  / alloc multiple small and large
+        #    assert(active memory < allocated memory)
+        def _test_lms_enabled(enabled):
+            torch.cuda.empty_cache()
+            torch.cuda.set_enabled_lms(enabled)
+            tensors = [alloc(32), alloc(128), alloc(10, 1024, 1024)]
+            if not enabled:
+                self.assertEqual(torch.cuda.memory_allocated(device), torch.cuda.memory_active(device))
+            else:
+                self.assertGreater(torch.cuda.memory_allocated(device), torch.cuda.memory_active(device))
+            del tensors
+
+        _test_lms_enabled(enabled=False)
+        _test_lms_enabled(enabled=True)
+
+        # 3. Test LMS Limit Swap
+        #    LMS On, limit 0 / alloc multiple small and large / record memory stats / alloc large
+        #    assert(allocated is unchanged)
+        # 4. Test LMS Limit Alloc
+        #    LMS On, limit high / alloc multiple small and large / record memory stats / alloc large
+        #    assert(allocated has increased)
+        def _test_lms_limit(zero):
+            torch.cuda.empty_cache()
+            torch.cuda.set_limit_lms(0 if zero else 1024*1024*1024)
+            tensors = [alloc(32), alloc(128), alloc(10, 1024, 1024)]
+            allocated = torch.cuda.memory_allocated(device)
+            tensors.append(alloc(10, 1024, 1024))
+            if zero:
+                self.assertEqual(torch.cuda.memory_allocated(device), allocated)
+            else:
+                self.assertGreater(torch.cuda.memory_allocated(device), allocated)
+            del tensors
+
+        _test_lms_limit(zero=True)
+        _test_lms_limit(zero=False)
+        torch.cuda.set_limit_lms(default_limit)
+
+        # 5. Test LMS Size Threshold On
+        #    LMS On, size 1MB / record memory stats / alloc multple small and large
+        #    assert(active memory has increased)
+        # 6. Test LMS Size Threshold Off
+        #    LMS On, size 0 / record memory stats / alloc multiple small and large
+        #    assert(active memory is unchanged)
+        def _test_lms_size(zero):
+            torch.cuda.empty_cache()
+            torch.cuda.set_size_lms(0 if zero else 1024*1024)
+            active = torch.cuda.memory_active(device)
+            tensors = [alloc(32), alloc(128), alloc(10, 1024, 1024)]
+            if zero:
+                self.assertEqual(torch.cuda.memory_active(device), active)
+            else:
+                self.assertGreater(torch.cuda.memory_active(device), active)
+            del tensors
+
+        _test_lms_size(zero=False)
+        _test_lms_size(zero=True)
+        torch.cuda.set_size_lms(default_size)
+
+        # 7. Test LMS Page-out
+        #    LMS On / alloc multiple small and large / record memory stats / reclaim all
+        #    assert(allocated has decreased && active/cached are unchanged)
+        torch.cuda.empty_cache()
+        tensors = [alloc(32), alloc(128), alloc(10, 1024, 1024)]
+        sums = list(map(torch.sum, tensors))
+        cached = torch.cuda.memory_cached(device)
+        allocated = torch.cuda.memory_allocated(device)
+        active = torch.cuda.memory_active(device)
+        torch.cuda.reclaim_inactive()
+        self.assertEqual(active, torch.cuda.memory_active(device))
+        self.assertEqual(cached, torch.cuda.memory_cached(device))
+        self.assertGreater(allocated, torch.cuda.memory_allocated(device))
+
+        # 8. Test LMS Page-in
+        #    Access tensors again
+        #    assert(tensor data is preserved during reclaim)
+        #    assert(allocated been restored && active/cached are still unchanged)
+        self.assertEqual(sums, list(map(torch.sum, tensors)))
+        self.assertEqual(active, torch.cuda.memory_active(device))
+        self.assertEqual(cached, torch.cuda.memory_cached(device))
+        self.assertEqual(allocated, torch.cuda.memory_allocated(device))
+        del sums
+        del tensors
+
+        # Reset LMS state
+        torch.cuda.set_enabled_lms(default_enabled)
 
 def load_ignore_file():
     from os.path import join, dirname
