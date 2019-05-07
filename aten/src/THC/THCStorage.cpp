@@ -25,6 +25,11 @@ void THCStorage_resize(THCState *state, THCStorage *self, ptrdiff_t size)
 
   size_t itemsize = self->itemsize();
 
+  if (self->lms_enabled()) {
+    THAssert(!self->lms_reclaimed());
+    self->lms_release_resources();
+  }
+
   if(size == 0)
   {
     self->set_data_ptr(at::DataPtr(nullptr, at::Device(at::DeviceType::CUDA, device)));
@@ -65,4 +70,13 @@ THC_API THCStorage* THCStorage_new(
       state->cudaDeviceAllocator,
       true).release();
   return storage;
+}
+
+void THCStorage_copy_to_host(THCState *state, THCStorage *storage, void *dst) {
+  size_t size = storage->capacity();
+  if (storage->lms_reclaimed()) {
+    storage->lms_copy_reclaimed_data(dst, size);
+  } else {
+    THCudaCheck(cudaMemcpy(dst, storage->data(), size, cudaMemcpyDeviceToHost));
+  }
 }

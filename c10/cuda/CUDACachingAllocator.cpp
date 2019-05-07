@@ -68,14 +68,19 @@ struct DeviceStats {
   uint64_t   max_amount_allocated;  // max total amount allocated in bytes
   uint64_t   amount_cached;         // total amount in cache in bytes
   uint64_t   max_amount_cached;     // max total amount in cache in bytes
+  uint64_t   amount_inactive;       // total amount in reclaim list in bytes
+  uint64_t   amount_active()        { return amount_allocated - amount_inactive; }
+  uint64_t   max_amount_active;     // max total active in bytes
 
   DeviceStats() :
       amount_allocated(0), max_amount_allocated(0),
-      amount_cached(0), max_amount_cached(0) { }
+      amount_cached(0), max_amount_cached(0),
+      amount_inactive(0), max_amount_active(0) { }
 
   void increaseAllocated(size_t delta) {
     amount_allocated += delta;
     max_amount_allocated = std::max(max_amount_allocated, amount_allocated);
+    max_amount_active = std::max(max_amount_active, amount_active());
   }
 
   void decreaseAllocated(size_t delta) {
@@ -89,6 +94,15 @@ struct DeviceStats {
 
   void decreaseCached(size_t delta) {
     amount_cached -= delta;
+  }
+
+  void increaseInactive(size_t delta) {
+    amount_inactive += delta;
+  }
+
+  void decreaseInactive(size_t delta) {
+    amount_inactive -= delta;
+    max_amount_active = std::max(max_amount_active, amount_active());
   }
 };
 
@@ -120,9 +134,6 @@ struct Block {
 
 static bool BlockComparator(const Block* a, const Block* b)
 {
-  if (a->device != b->device) {
-    return a->device < b->device;
-  }
   if (a->stream != b->stream) {
     return (uintptr_t)a->stream < (uintptr_t)b->stream;
   }
@@ -151,18 +162,68 @@ static std::string format_size(uint64_t size) {
   return os.str();
 }
 
+#define LMS_SIZE_DEFAULT (1 << 20) // 1 MB
+
+struct LMSSettings {
+  LMSSettings() :
+    enabled_(false), size_(LMS_SIZE_DEFAULT), limit_(0), host_allocator_(nullptr) {}
+
+  bool enabled()                 { return enabled_; }
+  void set_enabled(bool enabled) { enabled_ = enabled; }
+  size_t size()                  { return size_; }
+  void set_size(size_t size)     { size_ = size; }
+  size_t limit()                 { return limit_; }
+  void set_limit(size_t limit)   { limit_ = limit; }
+  at::Allocator* host_allocator()                        { return host_allocator_; }
+  void set_host_allocator(at::Allocator* host_allocator) { host_allocator_ = host_allocator; }
+
+  bool enabled(size_t size) {
+    return enabled_ && size >= size_;
+  }
+  bool limit_alloc(DeviceStats& stats, size_t alloc_size) {
+    return (stats.amount_cached + alloc_size) > limit_;
+  }
+
+private:
+  bool enabled_;
+  size_t size_;
+  size_t limit_;
+  at::Allocator* host_allocator_;
+};
+
+struct AllocParams {
+  AllocParams(int device, size_t size, cudaStream_t stream, BlockPool* pool, size_t alloc_size,
+              LMSSettings* lms, DeviceStats& stats) :
+    search_key(device, stream, size),
+    pool(pool),
+    alloc_size(alloc_size),
+    lms_enabled(lms->enabled(size)),
+    limit_alloc(lms_enabled && lms->limit_alloc(stats, alloc_size)),
+    block(nullptr),
+    err(cudaSuccess) {}
+
+  int device() { return search_key.device; }
+  cudaStream_t stream() { return search_key.stream; }
+  size_t size() { return search_key.size; }
+
+  Block search_key;
+  BlockPool* pool;
+  size_t alloc_size;
+  bool lms_enabled;
+  bool limit_alloc;
+  Block* block;
+  cudaError_t err;
+};
+
 } // namespace
 
-struct THCCachingAllocator
+struct DeviceCachingAllocator
 {
   // device statistics
-  std::vector<DeviceStats> device_stats;
+  DeviceStats stats;
 
   // lock around all operations
   std::recursive_mutex mutex;
-
-  // lock around calls to cudaFree (to prevent deadlocks with NCCL)
-  std::mutex cuda_free_mutex;
 
   // cached blocks larger than 1 MB
   BlockPool large_blocks;
@@ -170,109 +231,140 @@ struct THCCachingAllocator
   // cached blocks 1 MB or smaller
   BlockPool small_blocks;
 
-  // allocated blocks by device pointer
-  std::unordered_map<void*, Block*> allocated_blocks;
-
   // outstanding cuda events
   std::deque<std::pair<cudaEvent_t, Block*>> cuda_events;
 
-  THCCachingAllocator() :
+  at::IntrusiveList reclaim_list;
+
+  DeviceCachingAllocator() :
       large_blocks(BlockComparator),
       small_blocks(BlockComparator) {}
 
-  DeviceStats &get_stats_for_device(int device) {
-    AT_ASSERT(device >= 0);
-    if ((size_t) device >= device_stats.size()) {
-      device_stats.resize(device + 1);
+  bool get_free_block(AllocParams& p)
+  {
+    BlockPool& pool = *p.pool;
+    auto it = pool.lower_bound(&p.search_key);
+    if (it == pool.end() || (*it)->stream != p.stream())
+      return false;
+    p.block = *it;
+    pool.erase(it);
+    return true;
+  }
+
+  bool trigger_free_memory_callbacks(AllocParams& p) {
+    bool freed_memory = false;
+    for (const auto& name : FreeCudaMemoryCallbacksRegistry()->Keys()) {
+      freed_memory |=
+        FreeCudaMemoryCallbacksRegistry()->Create(name)->Execute();
     }
-    return device_stats.at(device);
+    return freed_memory;
+  }
+
+  bool alloc_block(AllocParams& p, bool record_error)
+  {
+    size_t size = p.alloc_size;
+    void* ptr;
+    cudaError_t err;
+    err = cudaMalloc(&ptr, size);
+    if (err != cudaSuccess) {
+      if (record_error) p.err = err; else cudaGetLastError();
+      return false;
+    }
+
+    stats.increaseCached(size);
+    p.block = new Block(p.device(), p.stream(), size, p.pool, (char*)ptr);
+    return (p.block != nullptr);
+  }
+
+  bool try_lms_reclaim(AllocParams& p) {
+    size_t size = p.size();
+    cudaStream_t stream = p.stream();
+    cudaEvent_t sync_event;
+
+    AT_ASSERT(stream == cuda::getCurrentCUDAStream().stream());
+    C10_CUDA_CHECK(cudaEventCreate(&sync_event));
+    C10_CUDA_CHECK(cudaEventRecord(sync_event, stream));
+
+    bool found =
+      // a. Search reclaim list for a suitable inactive allocation
+      (reclaim_one(size, sync_event) && get_free_block(p))
+      // b. Reclaim fragments of suitable allocations
+      || (reclaim_fragments(size, sync_event) && get_free_block(p))
+      // c. Attempt allocate (if not done earlier due to limit)
+      || (p.limit_alloc && alloc_block(p, false))
+      // d. Reclaim everything else
+      || (reclaim_all(sync_event) && get_free_block(p));
+
+    C10_CUDA_CHECK(cudaEventDestroy(sync_event));
+
+    return found;
   }
 
   /** allocates a block which is safe to use from the provided stream */
-  void malloc(void** devPtr, size_t size, cudaStream_t stream)
+  Block* malloc(int device, size_t size, cudaStream_t stream, LMSSettings* lms)
   {
     std::lock_guard<std::recursive_mutex> lock(mutex);
-
-    int device;
-    C10_CUDA_CHECK(cudaGetDevice(&device));
 
     // process outstanding cudaEvents
     process_events();
 
     size = round_size(size);
-
-    DeviceStats &stats = get_stats_for_device(device);
-
-    Block search_key(device, stream, size);
     auto& pool = get_pool(size);
+    const size_t alloc_size = get_allocation_size(size);
+    AllocParams params(device, size, stream, &pool, alloc_size, lms, stats);
 
-    auto find_free_block = [&]()->Block*{
-      auto it = pool.lower_bound(&search_key);
-      if (it != pool.end() && (*it)->device == device &&
-          (*it)->stream == stream) {
-        Block* block = *it;
-        pool.erase(it);
-        return block;
-      }
-      return nullptr;
-    };
+    bool block_found =
+      // 1. Search pool
+      get_free_block(params)
+      // 2. Trigger callbacks and retry search
+      || (trigger_free_memory_callbacks(params) && get_free_block(params))
+      // 3. Attempt allocate (if not limited by lms settings)
+      || (!params.limit_alloc && alloc_block(params, false))
+      // 4. If LMS enabled, try to reclaim inactive allocations
+      || (params.lms_enabled && try_lms_reclaim(params))
+      // 5. Free all non-split cached blocks and retry alloc.
+      || (free_cached_blocks() && alloc_block(params, true));
 
-    Block* block = find_free_block();
-    if (block == nullptr) {
-      bool freed_memory = false;
-      for (const auto& name : FreeCudaMemoryCallbacksRegistry()->Keys()) {
-        freed_memory |=
-            FreeCudaMemoryCallbacksRegistry()->Create(name)->Execute();
-      }
-      if (freed_memory) {
-        block = find_free_block();
+    AT_ASSERT((!block_found && params.err != cudaSuccess) || params.block);
+    if (!block_found) {
+      if (params.err == cudaErrorMemoryAllocation) {
+        cudaGetLastError();  // clear CUDA error
+
+        size_t device_free;
+        size_t device_total;
+        C10_CUDA_CHECK(cudaMemGetInfo(&device_free, &device_total));
+
+        // "total capacity": total global memory on GPU
+        // "already allocated": memory allocated by the program using the
+        //                      caching allocator
+        // "free": free memory as reported by the CUDA API
+        // "cached": memory held by the allocator but not used by the program
+        //
+        // The "allocated" amount  does not include memory allocated outside
+        // of the caching allocator, such as memory allocated by other programs
+        // or memory held by the driver.
+        //
+        // The sum of "allocated" + "free" + "cached" may be less than the
+        // total capacity due to memory held by the driver and usage by other
+        // programs.
+        //
+        // Note that at this point cuda_malloc_retry has already returned all
+        // possible "cached" memory to the driver. The only remaining "cached"
+        // memory is split from a larger block that is partially in-use.
+        AT_ERROR(
+          "CUDA out of memory. Tried to allocate ", format_size(alloc_size),
+          " (GPU ", device, "; ",
+          format_size(device_total), " total capacity; ",
+          format_size(stats.amount_allocated), " already allocated; ",
+          format_size(device_free), " free; ",
+          format_size(stats.amount_cached - stats.amount_allocated), " cached; ",
+          format_size(stats.amount_inactive), " inactive)");
+      } else {
+        C10_CUDA_CHECK(params.err);
       }
     }
-    if (block == nullptr) {
-      void* ptr;
-      size_t alloc_size = get_allocation_size(size);
-      cudaError_t err = cuda_malloc_retry(device, &ptr, alloc_size);
-      if (err != cudaSuccess) {
-        if (err == cudaErrorMemoryAllocation) {
-          cudaGetLastError();  // clear CUDA error
 
-          size_t device_free;
-          size_t device_total;
-          C10_CUDA_CHECK(cudaMemGetInfo(&device_free, &device_total));
-          const auto& stats = get_stats_for_device(device);
-
-          // "total capacity": total global memory on GPU
-          // "already allocated": memory allocated by the program using the
-          //                      caching allocator
-          // "free": free memory as reported by the CUDA API
-          // "cached": memory held by the allocator but not used by the program
-          //
-          // The "allocated" amount  does not include memory allocated outside
-          // of the caching allocator, such as memory allocated by other programs
-          // or memory held by the driver.
-          //
-          // The sum of "allocated" + "free" + "cached" may be less than the
-          // total capacity due to memory held by the driver and usage by other
-          // programs.
-          //
-          // Note that at this point cuda_malloc_retry has already returned all
-          // possible "cached" memory to the driver. The only remaining "cached"
-          // memory is split from a larger block that is partially in-use.
-          AT_ERROR(
-            "CUDA out of memory. Tried to allocate ", format_size(alloc_size),
-            " (GPU ", device, "; ",
-            format_size(device_total), " total capacity; ",
-            format_size(stats.amount_allocated), " already allocated; ",
-            format_size(device_free), " free; ",
-            format_size(stats.amount_cached - stats.amount_allocated), " cached)");
-        } else {
-          C10_CUDA_CHECK(err);
-        }
-      }
-      stats.increaseCached(alloc_size);
-      block = new Block(device, stream, alloc_size, &pool, ptr);
-    }
-
+    Block* block = params.block;
     Block* remaining = nullptr;
     AT_ASSERT(block);
     if (should_split(block, size)) {
@@ -293,30 +385,18 @@ struct THCCachingAllocator
     }
 
     block->allocated = true;
-    allocated_blocks[block->ptr] = block;
-
-    *devPtr = block->ptr;
 
     stats.increaseAllocated(block->size);
+
+    return block;
   }
 
-  void free(void* ptr)
+  void free(Block* block)
   {
     std::lock_guard<std::recursive_mutex> lock(mutex);
-    if (!ptr) {
-      return;
-    }
-
-    auto it = allocated_blocks.find(ptr);
-    if (it == allocated_blocks.end()) {
-      AT_ERROR("invalid device pointer: ", ptr);
-    }
-
-    Block* block = it->second;
-    allocated_blocks.erase(it);
     block->allocated = false;
 
-    get_stats_for_device(block->device).decreaseAllocated(block->size);
+    stats.decreaseAllocated(block->size);
     if (!block->stream_uses.empty()) {
       insert_events(block);
     } else {
@@ -328,18 +408,12 @@ struct THCCachingAllocator
   void emptyCache()
   {
     std::lock_guard<std::recursive_mutex> lock(mutex);
-    synchronize_and_free_events(nullopt);
-    free_blocks(large_blocks, large_blocks.begin(), large_blocks.end());
-    free_blocks(small_blocks, small_blocks.begin(), small_blocks.end());
+    free_cached_blocks();
   }
 
-  void* getBaseAllocation(void* ptr, size_t* outSize)
+  void* getBaseAllocation(Block* block, size_t* outSize)
   {
     std::lock_guard<std::recursive_mutex> lock(mutex);
-    Block* block = find_allocated_block(ptr);
-    if (!block) {
-      AT_ERROR("invalid device pointer: ", ptr);
-    }
     while (block->prev) {
       block = block->prev;
     }
@@ -356,11 +430,9 @@ struct THCCachingAllocator
   }
 
   // Accumulates sizes of all memory blocks for given device in given pool
-  void cacheInfoAux(BlockPool& blocks, int dev_id, size_t* total, size_t* largest)
+  void cacheInfoAux(BlockPool& blocks, size_t* total, size_t* largest)
   {
-    Block search_key(dev_id, 0, 0);
-    auto it = blocks.lower_bound(&search_key);
-    for (; it != blocks.end() && *it && (*it)->device == dev_id; ++it) {
+    for (auto it = blocks.begin(); it != blocks.end(); ++it) {
       size_t blocksize = (*it)->size;
       *total += blocksize;
       if (blocksize > *largest) {
@@ -369,30 +441,22 @@ struct THCCachingAllocator
     }
   }
 
-  void cacheInfo(int dev_id, size_t* total, size_t* largest)
+  void cacheInfo(size_t* total, size_t* largest)
   {
     std::lock_guard<std::recursive_mutex> lock(mutex);
-    cacheInfoAux(large_blocks, dev_id, total, largest);
-    cacheInfoAux(small_blocks, dev_id, total, largest);
+    cacheInfoAux(large_blocks, total, largest);
+    cacheInfoAux(small_blocks, total, largest);
   }
 
-  void recordStream(void* ptr, cuda::CUDAStream stream)
+  void recordStream(Block* block, cuda::CUDAStream stream)
   {
-    // Empty tensor's storage().data() might be a null ptr. As there is no
-    // blocks associated with those tensors, it is fine to do nothing here.
-    if (ptr) {
-      std::lock_guard<std::recursive_mutex> lock(mutex);
-      Block* block = find_allocated_block(ptr);
-      if (!block) {
-        AT_ERROR("invalid device pointer: ", ptr);
-      }
-      if (stream.stream() == block->stream) {
-        // ignore uses on the allocation stream, since those don't require any
-        // special synchronization
-        return;
-      }
-      block->stream_uses.insert(stream);
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    if (stream.stream() == block->stream) {
+      // ignore uses on the allocation stream, since those don't require any
+      // special synchronization
+      return;
     }
+    block->stream_uses.insert(stream);
   }
 
   /** moves a block into a pool of cached free blocks */
@@ -447,7 +511,7 @@ struct THCCachingAllocator
     }
   }
 
-  size_t round_size(size_t size) {
+  static size_t round_size(size_t size) {
     if (size < kMinBlockSize) {
       return kMinBlockSize;
     } else {
@@ -455,7 +519,7 @@ struct THCCachingAllocator
     }
   }
 
-  size_t get_allocation_size(size_t size) {
+  static size_t get_allocation_size(size_t size) {
     if (size <= kSmallSize) {
       return kSmallBuffer;
     } else if (size < kMinLargeAlloc) {
@@ -465,51 +529,28 @@ struct THCCachingAllocator
     }
   }
 
-  cudaError_t cuda_malloc_retry(int device, void** devPtr, size_t size)
-  {
-    // Try cudaMalloc. If cudaMalloc fails, frees all non-split cached blocks
-    // and retries.
-    cudaError_t err = cudaMalloc(devPtr, size);
-    if (err != cudaSuccess) {
-      cudaGetLastError();  // reset the last CUDA error
-      free_cached_blocks(device);
-      err = cudaMalloc(devPtr, size);
-      if (err != cudaSuccess) {
-        return err;
-      }
-    }
-    return cudaSuccess;
-  }
-
-  void free_cached_blocks(int device)
+  bool free_cached_blocks()
   {
     // First ensure that all blocks that can't currently be allocated due to
     // outstanding events are returned to the pool.
-    synchronize_and_free_events(device);
+    synchronize_and_free_events();
 
-    // Free all non-split cached blocks on device
-    Block lower_bound(device, nullptr, 0);
-    Block upper_bound(device + 1, nullptr, 0);
-
-    free_blocks(
-        large_blocks,
-        large_blocks.lower_bound(&lower_bound),
-        large_blocks.lower_bound(&upper_bound));
-    free_blocks(
-        small_blocks,
-        small_blocks.lower_bound(&lower_bound),
-        small_blocks.lower_bound(&upper_bound));
+    // Free all non-split cached blocks
+    free_blocks(large_blocks);
+    free_blocks(small_blocks);
+    return true;
   }
 
-  void free_blocks(BlockPool& blocks, BlockPool::iterator it, BlockPool::iterator end)
+  void free_blocks(BlockPool& blocks)
   {
-    // Frees all non-split blocks between `it` and `end`
-    std::lock_guard<std::mutex> lock(cuda_free_mutex);
-    while (it != end) {
+    // Frees all non-split blocks
+    std::lock_guard<std::mutex> lock(*CUDACachingAllocator::getFreeMutex());
+    auto it = blocks.begin();
+    while (it != blocks.end()) {
       Block* block = *it;
       if (!block->prev && !block->next) {
         C10_CUDA_CHECK(cudaFree((void*)block->ptr));
-        get_stats_for_device(block->device).decreaseCached(block->size);
+        stats.decreaseCached(block->size);
         auto cur = it;
         ++it;
         blocks.erase(cur);
@@ -520,19 +561,12 @@ struct THCCachingAllocator
     }
   }
 
-  void synchronize_and_free_events(optional<int> device) {
+  void synchronize_and_free_events() {
     // Synchronize on outstanding events and then free associated blocks.
-    // Limited to blocks on the given device if specified.
-
-    auto remaining_events = decltype(cuda_events)();
 
     for (auto& e : cuda_events) {
       cudaEvent_t event = e.first;
       Block* block = e.second;
-      if (device.has_value() && block->device != *device) {
-        remaining_events.push_back(e);
-        continue;
-      }
 
       C10_CUDA_CHECK(cudaEventSynchronize(event));
       C10_CUDA_CHECK(cudaEventDestroy(event));
@@ -543,15 +577,7 @@ struct THCCachingAllocator
       }
     }
 
-    std::swap(cuda_events, remaining_events);
-  }
-
-  Block* find_allocated_block(void *ptr) {
-    auto it = allocated_blocks.find(ptr);
-    if (it == allocated_blocks.end()) {
-      return nullptr;
-    }
-    return it->second;
+    cuda_events.clear();
   }
 
   void insert_events(Block* block)
@@ -605,9 +631,309 @@ struct THCCachingAllocator
       cuda_events.pop_front();
     }
   }
+
+  void reclaim_list_add(StorageImpl* storage) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    size_t storage_size = round_size(storage->capacity());
+    stats.increaseInactive(storage_size);
+    storage->lms_list_add(&reclaim_list);
+  }
+
+  bool reclaim_list_remove(StorageImpl* storage) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    if (!storage->lms_list_remove())
+      return false;
+
+    size_t storage_size = round_size(storage->capacity());
+    stats.decreaseInactive(storage_size);
+    return true;
+  }
+
+  bool reclaim_one(size_t size, cudaEvent_t sync_event) {
+    StorageImpl *best = nullptr;
+    size_t best_size = ULONG_MAX;
+
+    if (!reclaim_list.empty()) {
+      auto hook = reclaim_list.head();
+      auto end = reclaim_list.terminator();
+      do {
+        StorageImpl *storage = at::StorageImpl::from_list_hook(hook);
+        hook = hook->next();
+
+        size_t storage_size = round_size(storage->capacity());
+        if (storage_size >= size && storage_size < best_size) {
+          best = storage;
+          best_size = storage_size;
+          if (storage_size == size)
+            break;
+        }
+      } while (hook != end);
+    }
+
+    if (best == nullptr)
+      return false;
+
+    stats.decreaseInactive(best_size);
+    best->lms_list_remove();
+    best->lms_pageout(sync_event);
+    best->lms_pageout_sync();
+    return true;
+  }
+
+  static inline void process_pageout_sync(at::IntrusiveList* iodone_queue) {
+    while (!iodone_queue->empty()) {
+      auto hook = iodone_queue->head();
+      StorageImpl *storage = at::StorageImpl::from_list_hook(hook);
+      storage->lms_pageout_sync(iodone_queue);
+    }
+  }
+
+  bool reclaim_fragments(size_t size, cudaEvent_t sync_event) {
+    at::IntrusiveList iodone_queue;
+    size_t alloc_size;
+    int count = 0;
+
+    if (!reclaim_list.empty()) {
+      auto hook = reclaim_list.head();
+      auto end = reclaim_list.terminator();
+      do {
+        StorageImpl *storage = at::StorageImpl::from_list_hook(hook);
+        hook = hook->next();
+
+        CUDACachingAllocator::getBaseAllocation(storage->allocation_ptr(), &alloc_size);
+        if (alloc_size >= size) {
+          size_t storage_size = round_size(storage->capacity());
+          stats.decreaseInactive(storage_size);
+          storage->lms_list_remove();
+          storage->lms_pageout(sync_event, &iodone_queue);
+          count++;
+        }
+      } while (hook != end);
+    }
+
+    if (count == 0)
+      return false;
+
+    process_pageout_sync(&iodone_queue);
+    return true;
+  }
+
+  bool reclaim_all(cudaEvent_t sync_event) {
+    at::IntrusiveList iodone_queue;
+    int count = 0;
+
+    if (!reclaim_list.empty()) {
+      auto hook = reclaim_list.head();
+      auto end = reclaim_list.terminator();
+      do {
+        StorageImpl *storage = at::StorageImpl::from_list_hook(hook);
+        hook = hook->next();
+
+        size_t storage_size = round_size(storage->capacity());
+        stats.decreaseInactive(storage_size);
+        storage->lms_list_remove();
+        storage->lms_pageout(sync_event, &iodone_queue);
+        count++;
+      } while (hook != end);
+    }
+
+    if (count == 0)
+      return false;
+
+    process_pageout_sync(&iodone_queue);
+    return true;
+  }
+
+  void reclaimInactive()
+  {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+
+    if (!reclaim_list.empty()) {
+      cudaStream_t stream = cuda::getCurrentCUDAStream().stream();
+      cudaEvent_t sync_event;
+
+      C10_CUDA_CHECK(cudaEventCreate(&sync_event));
+      C10_CUDA_CHECK(cudaEventRecord(sync_event, stream));
+      reclaim_all(sync_event);
+      C10_CUDA_CHECK(cudaEventDestroy(sync_event));
+    }
+  }
+};
+
+struct THCCachingAllocator {
+  std::mutex mutex;
+  std::vector<DeviceCachingAllocator*> device_allocator;
+
+  // allocated blocks by device pointer
+  std::unordered_map<void*, Block*> allocated_blocks;
+
+  // lock around calls to cudaFree (to prevent deadlocks with NCCL)
+  std::mutex cuda_free_mutex;
+
+  LMSSettings lms_settings;
+
+  void init(int device_count, at::Allocator* host_allocator) {
+    int size = device_allocator.size();
+    if (size < device_count) {
+      device_allocator.resize(device_count);
+      for (int i = size; i < device_count; i++) {
+        device_allocator[i] = new DeviceCachingAllocator();
+      }
+    }
+    lms_settings.set_host_allocator(host_allocator);
+  }
+
+  void malloc(void** devPtr, size_t size, cudaStream_t stream) {
+    int device;
+    C10_CUDA_CHECK(cudaGetDevice(&device));
+    Block* block = device_allocator[device]->malloc(device, size, stream, &lms_settings);
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      allocated_blocks[block->ptr] = block;
+    }
+    *devPtr = (void*)block->ptr;
+  }
+
+  void free(void* ptr) {
+    if (!ptr) {
+      return;
+    }
+    Block* block = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      auto it = allocated_blocks.find(ptr);
+      if (it == allocated_blocks.end()) {
+        AT_ERROR("invalid device pointer: ", ptr);
+      }
+      block = it->second;
+      allocated_blocks.erase(it);
+    }
+    device_allocator[block->device]->free(block);
+  }
+
+  void emptyCache() {
+    int count = device_allocator.size();
+    for (int i = 0; i < count; i++)
+      device_allocator[i]->emptyCache();
+  }
+
+  Block* find_allocated_block(void *ptr) {
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = allocated_blocks.find(ptr);
+    if (it == allocated_blocks.end()) {
+      return nullptr;
+    }
+    return it->second;
+  }
+
+  void* getBaseAllocation(void* ptr, size_t* outSize)
+  {
+    Block* block = find_allocated_block(ptr);
+    if (!block) {
+      AT_ERROR("invalid device pointer: ", ptr);
+    }
+    return device_allocator[block->device]->getBaseAllocation(block, outSize);
+  }
+
+  void recordStream(void* ptr, cuda::CUDAStream stream)
+  {
+    // Empty tensor's storage().data() might be a null ptr. As there is no
+    // blocks associated with those tensors, it is fine to do nothing here.
+    if (ptr) {
+      Block* block = find_allocated_block(ptr);
+      if (!block) {
+        AT_ERROR("invalid device pointer: ", ptr);
+      }
+      device_allocator[block->device]->recordStream(block, stream);
+    }
+  }
+
+  void cacheInfo(int dev_id, size_t* total, size_t* largest) {
+    device_allocator[dev_id]->cacheInfo(total, largest);
+  }
+
+  void reclaimInactive() {
+    int count = device_allocator.size();
+    for (int i = 0; i < count; i++)
+      device_allocator[i]->reclaimInactive();
+  }
 };
 
 THCCachingAllocator caching_allocator;
+
+
+#define LMS_INVALID_STREAM ((cudaStream_t)-1)
+
+struct CudaLMSImpl : public at::LMSImpl {
+  CudaLMSImpl() :
+    at::LMSImpl(caching_allocator.lms_settings.host_allocator()),
+    stream_(LMS_INVALID_STREAM) {}
+  ~CudaLMSImpl() {
+    destroy_stream();
+  }
+
+  void release_resources() {
+    at::LMSImpl::release_resources();
+    destroy_stream();
+  }
+
+  void reclaim_list_add(at::IntrusiveListHook* hook) {
+    at::StorageImpl* storage = at::StorageImpl::from_list_hook(hook);
+    size_t size = storage->capacity();
+    size_t storage_size = DeviceCachingAllocator::round_size(size);
+    if (size == 0 || !caching_allocator.lms_settings.enabled(storage_size))
+      return;
+    int device = storage->device().index();
+    caching_allocator.device_allocator[device]->reclaim_list_add(storage);
+  }
+
+  bool reclaim_list_remove(at::IntrusiveListHook* hook) {
+    at::StorageImpl* storage = at::StorageImpl::from_list_hook(hook);
+    int device = storage->device().index();
+    return caching_allocator.device_allocator[device]->reclaim_list_remove(storage);
+  }
+
+ protected:
+  cudaStream_t stream() const {
+    AT_ASSERT(stream_ != LMS_INVALID_STREAM);
+    return stream_;
+  }
+
+  void create_stream() {
+    if (stream_ == LMS_INVALID_STREAM) {
+      const unsigned int kFlags = cudaStreamDefault;
+      C10_CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, kFlags));
+    }
+  }
+
+  void destroy_stream() {
+    if (stream_ != LMS_INVALID_STREAM) {
+      C10_CUDA_CHECK(cudaStreamDestroy(stream_));
+      stream_ = LMS_INVALID_STREAM;
+    }
+  }
+
+  void do_pagein(void* dst, void* src, size_t size) {
+    C10_CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, stream()));
+  }
+
+  void do_pagein_sync() {
+    C10_CUDA_CHECK(cudaStreamSynchronize(stream()));
+  }
+
+  void do_pageout(void* dst, void* src, size_t size, at::LMSSyncEvent_t sync_event) {
+    create_stream();
+    C10_CUDA_CHECK(cudaStreamWaitEvent(stream(), (cudaEvent_t)sync_event, 0));
+    C10_CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost, stream()));
+  }
+
+  void do_pageout_sync() {
+    C10_CUDA_CHECK(cudaStreamSynchronize(stream()));
+  }
+
+  cudaStream_t stream_;
+};
+
 
 static void CudaCachingDeleter(void* ptr) {
   caching_allocator.free(ptr);
@@ -629,6 +955,9 @@ struct CudaCachingAllocator : public Allocator {
   DeleterFnPtr raw_deleter() const override {
     return &CudaCachingDeleter;
   }
+  at::LMSImpl* lms() const {
+    return caching_allocator.lms_settings.enabled() ? new CudaLMSImpl() : nullptr;
+  }
 };
 
 CudaCachingAllocator device_allocator;
@@ -636,6 +965,10 @@ CudaCachingAllocator device_allocator;
 Allocator* get(void)
 {
   return &device_allocator;
+}
+
+void init(int device_count, at::Allocator* host_allocator) {
+  caching_allocator.init(device_count, host_allocator);
 }
 
 void emptyCache(void) {
@@ -669,35 +1002,80 @@ static inline void assertValidDevice(int device) {
 uint64_t currentMemoryAllocated(int device)
 {
   assertValidDevice(device);
-  return caching_allocator.get_stats_for_device(device).amount_allocated;
+  return caching_allocator.device_allocator[device]->stats.amount_allocated;
 }
 
 uint64_t maxMemoryAllocated(int device) {
   assertValidDevice(device);
-  return caching_allocator.get_stats_for_device(device).max_amount_allocated;
+  return caching_allocator.device_allocator[device]->stats.max_amount_allocated;
 }
 
 void resetMaxMemoryAllocated(int device) {
   assertValidDevice(device);
-  DeviceStats& stats = caching_allocator.get_stats_for_device(device);
+  DeviceStats& stats = caching_allocator.device_allocator[device]->stats;
   stats.max_amount_allocated = stats.amount_allocated;
 }
 
 uint64_t currentMemoryCached(int device)
 {
   assertValidDevice(device);
-  return caching_allocator.get_stats_for_device(device).amount_cached;
+  return caching_allocator.device_allocator[device]->stats.amount_cached;
 }
 
 uint64_t maxMemoryCached(int device) {
   assertValidDevice(device);
-  return caching_allocator.get_stats_for_device(device).max_amount_cached;
+  return caching_allocator.device_allocator[device]->stats.max_amount_cached;
 }
 
 void resetMaxMemoryCached(int device) {
   assertValidDevice(device);
-  DeviceStats& stats = caching_allocator.get_stats_for_device(device);
+  DeviceStats& stats = caching_allocator.device_allocator[device]->stats;
   stats.max_amount_cached = stats.amount_cached;
+}
+
+uint64_t currentMemoryActive(int device)
+{
+  assertValidDevice(device);
+  return caching_allocator.device_allocator[device]->stats.amount_active();
+}
+
+uint64_t maxMemoryActive(int device) {
+  assertValidDevice(device);
+  return caching_allocator.device_allocator[device]->stats.max_amount_active;
+}
+
+void resetMaxMemoryActive(int device) {
+  assertValidDevice(device);
+  DeviceStats& stats = caching_allocator.device_allocator[device]->stats;
+  stats.max_amount_active = stats.amount_active();
+}
+
+void setUserEnabledLMS(bool enable) {
+  caching_allocator.lms_settings.set_enabled(enable);
+}
+
+bool userEnabledLMS(void) {
+  return caching_allocator.lms_settings.enabled();
+}
+
+void setUserSizeLMS(size_t size) {
+  caching_allocator.lms_settings.set_size(size);
+}
+
+size_t userSizeLMS(void) {
+  return caching_allocator.lms_settings.size();
+}
+
+void setUserLimitLMS(size_t limit) {
+  caching_allocator.lms_settings.set_limit(limit);
+}
+
+size_t userLimitLMS(void) {
+  return caching_allocator.lms_settings.limit();
+}
+
+void reclaimInactive(void) {
+  caching_allocator.reclaimInactive();
 }
 
 //
