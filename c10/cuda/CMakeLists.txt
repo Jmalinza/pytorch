@@ -20,12 +20,14 @@ configure_file(
 # tools/amd_build/pyHIPIFY/cuda_to_hip_mappings.py for new files
 # and headers you add
 set(C10_CUDA_SRCS
+    CUDAAffinity.cpp
     CUDAStream.cpp
     CUDACachingAllocator.cpp
     impl/CUDAGuardImpl.cpp
     impl/CUDATest.cpp
 )
 set(C10_CUDA_HEADERS
+    CUDAAffinity.h
     CUDAException.h
     CUDAGuard.h
     CUDAMacros.h

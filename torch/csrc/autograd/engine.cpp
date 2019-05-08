@@ -11,6 +11,7 @@
 #include <ATen/ExpandUtils.h>
 #include <ATen/Parallel.h>
 #include <c10/util/Exception.h>
+#include <c10/cuda/CUDAAffinity.h>
 
 #include <atomic>
 #include <condition_variable>
@@ -243,7 +244,11 @@ auto Engine::thread_init(int device) -> void {
     for (size_t i = 0; i < static_cast<size_t>(c10::DeviceType::COMPILE_TIME_MAX_DEVICE_TYPES); i++) {
       auto* impl = c10::impl::device_guard_impl_registry[i].load();
       if (impl && device < impl->deviceCount()) {
-        guards[i].reset_device(at::Device(static_cast<c10::DeviceType>(i), device));
+        c10::DeviceType deviceType = static_cast<c10::DeviceType>(i);
+        guards[i].reset_device(at::Device(deviceType, device));
+        if (deviceType == c10::DeviceType::CUDA) {
+          c10::cuda::CUDAAffinity::set_affinity(device);
+        }
       }
     }
   }
