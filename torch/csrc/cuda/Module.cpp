@@ -7,6 +7,7 @@
 #include <TH/TH.h>
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAAffinity.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #ifdef USE_NCCL
 #include <nccl.h>
@@ -31,6 +32,7 @@ THCState *state;
 void THCPModule_setDevice(int device)
 {
   THCudaCheck(cudaSetDevice(device));
+  c10::cuda::CUDAAffinity::set_affinity(device);
 }
 
 PyObject * THCPModule_setDevice_wrap(PyObject *self, PyObject *arg)
@@ -334,6 +336,24 @@ PyObject * THCPModule_resetMaxMemoryCached(PyObject *_unused, PyObject *arg)
   Py_RETURN_NONE;
 }
 
+PyObject *THCPModule_setUserEnabledAffinity(PyObject *_unused, PyObject *arg)
+{
+  HANDLE_TH_ERRORS
+  THPUtils_assert(PyBool_Check(arg), "set_enabled_affinity expects a bool, "
+          "but got %s", THPUtils_typename(arg));
+  c10::cuda::CUDAAffinity::set_enabled(arg == Py_True);
+  Py_RETURN_NONE;
+  END_HANDLE_TH_ERRORS
+}
+
+PyObject *THCPModule_userEnabledAffinity(PyObject *_unused)
+{
+  HANDLE_TH_ERRORS
+  if (c10::cuda::CUDAAffinity::enabled()) Py_RETURN_TRUE;
+  else Py_RETURN_FALSE;
+  END_HANDLE_TH_ERRORS
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Cuda module initialization
 ////////////////////////////////////////////////////////////////////////////////
@@ -445,6 +465,8 @@ static struct PyMethodDef _THCPModule_methods[] = {
   {"_cuda_memoryCached", (PyCFunction) THCPModule_memoryCached, METH_O,  nullptr},
   {"_cuda_maxMemoryCached", (PyCFunction) THCPModule_maxMemoryCached, METH_O,  nullptr},
   {"_cuda_resetMaxMemoryCached", (PyCFunction) THCPModule_resetMaxMemoryCached, METH_O,  nullptr},
+  {"_cuda_getEnabledAffinity", (PyCFunction)THCPModule_userEnabledAffinity, METH_NOARGS, nullptr},
+  {"_cuda_setEnabledAffinity", (PyCFunction)THCPModule_setUserEnabledAffinity, METH_O,   nullptr},
   {"_cuda_manualSeed",  (PyCFunction)THCPModule_manualSeed,       METH_O,       nullptr},
   {"_cuda_manualSeedAll", (PyCFunction)THCPModule_manualSeedAll,  METH_O,       nullptr},
   {"_cuda_seed",        (PyCFunction)THCPModule_seed,             METH_NOARGS,  nullptr},

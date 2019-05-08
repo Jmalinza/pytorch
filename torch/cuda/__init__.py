@@ -225,8 +225,7 @@ class device(object):
         if self.idx == -1:
             return
         self.prev_idx = torch._C._cuda_getDevice()
-        if self.prev_idx != self.idx:
-            torch._C._cuda_setDevice(self.idx)
+        torch._C._cuda_setDevice(self.idx)
         _lazy_init()
 
     def __exit__(self, *args):
@@ -544,6 +543,20 @@ def reset_max_memory_cached(device=None):
     """
     device = _get_device_index(device, optional=True)
     return torch._C._cuda_resetMaxMemoryCached(device)
+
+
+def set_enabled_affinity(enable):
+    r"""Enable/disable CPU/GPU affinity.
+
+    Arguments:
+        enable (bool): desired affinity setting.
+    """
+    torch._C._cuda_setEnabledAffinity(enable)
+
+
+def get_enabled_affinity():
+    r"""Returns a bool indicating if CPU/GPU affinity is currently enabled."""
+    return torch._C._cuda_getEnabledAffinity()
 
 
 def _host_allocator():

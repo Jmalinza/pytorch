@@ -8,6 +8,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include <ATen/cuda/CUDAContext.h>
 
+#include <c10/cuda/CUDAAffinity.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -50,6 +51,8 @@ void THCudaInit(THCState* state)
   int numDevices = 0;
   THCudaCheck(cudaGetDeviceCount(&numDevices));
   state->numDevices = numDevices;
+
+  c10::cuda::CUDAAffinity::init(numDevices);
 
   int device = 0;
   THCudaCheck(cudaGetDevice(&device));
