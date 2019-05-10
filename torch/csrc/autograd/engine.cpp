@@ -81,12 +81,16 @@ struct CompareFunctionTaskTime {
 };
 
 struct ReadyQueue {
+  ReadyQueue() : worker_ready(false) {}
   std::priority_queue<FunctionTask, std::vector<FunctionTask>, CompareFunctionTaskTime> heap;
-  std::condition_variable not_empty;
+  std::condition_variable cond;
   std::mutex mutex;
+  bool worker_ready;
 
   void push(FunctionTask item);
   FunctionTask pop();
+  void signal_ready();
+  void wait_ready();
 };
 
 // Note [Reentrant backwards]
@@ -189,15 +193,28 @@ auto ReadyQueue::push(FunctionTask item) -> void {
     ++item.base->outstanding_tasks;
     heap.push(std::move(item));
   }
-  not_empty.notify_one();
+  cond.notify_one();
 }
 
 auto ReadyQueue::pop() -> FunctionTask {
   std::unique_lock<std::mutex> lock(mutex);
-  not_empty.wait(lock, [this]{ return !heap.empty(); });
+  cond.wait(lock, [this]{ return !heap.empty(); });
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
   auto task = std::move(const_cast<FunctionTask&>(heap.top())); heap.pop();
   return task;
+}
+
+auto ReadyQueue::signal_ready() -> void {
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    worker_ready = true;
+  }
+  cond.notify_one();
+}
+
+auto ReadyQueue::wait_ready() -> void {
+  std::unique_lock<std::mutex> lock(mutex);
+  cond.wait(lock, [this]{ return worker_ready; });
 }
 
 Engine::Engine() = default;
@@ -272,6 +289,8 @@ auto Engine::thread_init(int device) -> void {
 // in case this code is to be changed.
 auto Engine::thread_main(GraphTask *graph_task) -> void {
   auto queue = ready_queues[worker_device + 1];
+  queue->signal_ready();
+
   // Why the test on graph_task->outstanding_tasks?  See
   // Note [Reentrant backwards]
   while (!graph_task || graph_task->outstanding_tasks > 0) {
@@ -688,11 +707,16 @@ auto Engine::start_threads() -> void {
   // types)
   int num_threads = num_devices + 1;
   ready_queues = std::vector<std::shared_ptr<ReadyQueue>>(num_threads);
-  for (auto& queue : ready_queues)
+  std::vector<std::thread> threads;
+  int i = -1;
+  for (auto& queue : ready_queues) {
     queue.reset(new ReadyQueue());
-  for (int i = 0; i < num_threads; ++i) {
-    std::thread t(&Engine::thread_init, this, i - 1);
-    t.detach();
+    threads.push_back(std::thread(&Engine::thread_init, this, i));
+    i++;
+  }
+  for (i = 0; i < num_threads; ++i) {
+    ready_queues[i]->wait_ready();
+    threads[i].detach();
   }
 }
 
