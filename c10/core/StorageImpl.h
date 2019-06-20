@@ -55,9 +55,9 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
   ~StorageImpl() = default;
 
   void reset() {
+    lms_.unset();
     data_ptr_.clear();
     numel_ = 0;
-    lms_.unset();
   }
 
   template <typename T>
@@ -85,8 +85,8 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
   }
 
   void release_resources() override {
-    data_ptr_.clear();
     lms_.release_resources();
+    data_ptr_.clear();
   }
 
   size_t itemsize() const {
@@ -191,6 +191,7 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
       at::DataPtr&& data_ptr,
       const caffe2::TypeMeta& data_type,
       size_t capacity) {
+    lms_.unset();
     data_type_ = data_type;
     // TODO: Use CAFFE_ENFORCE_WITH_CALLER equivalent
     // For now causes lots of redefine issues if caffe2/core/logging.h is used
@@ -208,7 +209,6 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
     numel_ = capacity / data_type_.itemsize();
     allocator_ = nullptr;
     resizable_ = false;
-    lms_.unset();
   }
 
   // This method can be used only after storage construction and cannot be used
