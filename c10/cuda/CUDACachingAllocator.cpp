@@ -868,14 +868,7 @@ struct CudaLMSImpl : public at::LMSImpl {
   CudaLMSImpl() :
     at::LMSImpl(caching_allocator.lms_settings.host_allocator()),
     stream_(LMS_INVALID_STREAM) {}
-  ~CudaLMSImpl() {
-    destroy_stream();
-  }
-
-  void release_resources() {
-    at::LMSImpl::release_resources();
-    destroy_stream();
-  }
+  ~CudaLMSImpl() {}
 
   void reclaim_list_add(at::IntrusiveListHook* hook) {
     at::StorageImpl* storage = at::StorageImpl::from_list_hook(hook);
@@ -899,17 +892,9 @@ struct CudaLMSImpl : public at::LMSImpl {
     return stream_;
   }
 
-  void create_stream() {
+  void assign_stream() {
     if (stream_ == LMS_INVALID_STREAM) {
-      const unsigned int kFlags = cudaStreamDefault;
-      C10_CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, kFlags));
-    }
-  }
-
-  void destroy_stream() {
-    if (stream_ != LMS_INVALID_STREAM) {
-      C10_CUDA_CHECK(cudaStreamDestroy(stream_));
-      stream_ = LMS_INVALID_STREAM;
+      stream_ = cuda::getLMSCUDAStream().stream();
     }
   }
 
@@ -922,7 +907,7 @@ struct CudaLMSImpl : public at::LMSImpl {
   }
 
   void do_pageout(void* dst, void* src, size_t size, at::LMSSyncEvent_t sync_event) {
-    create_stream();
+    assign_stream();
     C10_CUDA_CHECK(cudaStreamWaitEvent(stream(), (cudaEvent_t)sync_event, 0));
     C10_CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost, stream()));
   }
