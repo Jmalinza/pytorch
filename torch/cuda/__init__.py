@@ -597,6 +597,77 @@ def reset_max_memory_active(device=None):
     return torch._C._cuda_resetMaxMemoryActive(device)
 
 
+def memory_reclaimed(device=None):
+    r"""Returns the total GPU memory transferred to the host by Large Model Support
+    in bytes for a given device.
+
+    Arguments:
+        device (torch.device or int, optional): selected device. Returns
+            statistic for the current device, given by :func:`~torch.cuda.current_device`,
+            if :attr:`device` is ``None`` (default).
+
+    .. note::
+        This will be non-zero only when Large Model Support is enabled.
+    """
+    device = _get_device_index(device, optional=True)
+    return torch._C._cuda_memoryReclaimed(device)
+
+def reset_memory_reclaimed(device=None):
+    r"""Resets the starting point in tracking the total GPU memory transfered to the host
+    by Large Model Support.
+
+    See :func:`~torch.cuda.memory_reclaimed` for details.
+
+    Arguments:
+        device (torch.device or int, optional): selected device. Returns
+            statistic for the current device, given by :func:`~torch.cuda.current_device`,
+            if :attr:`device` is ``None`` (default).
+    """
+    device = _get_device_index(device, optional=True)
+    return torch._C._cuda_resetMemoryReclaimed(device)
+
+def alloc_distribution(device=None):
+    r"""Returns a histogram (encoded as a python dictionary) showing the distribution of allocation
+    sources for a given device.  Each allocation satisfied by the CUDA Caching Allocator is retrieved
+    from a particular source.  The allocation distribution counts the number of allocations satisfied
+    from each source.
+
+    The set of possible sources are:
+
+    * `'freelist'`
+    * `'cudamalloc'`
+    * `'reclaim_one'`
+    * `'reclaim_fragments'`
+    * `'cudamalloc_over_limit'`
+    * `'reclaim_all'`
+    * `'cudamalloc_purge'`
+
+    Arguments:
+        device (torch.device or int, optional): selected device. Returns
+            statistic for the current device, given by :func:`~torch.cuda.current_device`,
+            if :attr:`device` is ``None`` (default).
+
+    .. note::
+        The `reclaim_one`, `reclaim_fragments`, `cudamalloc_over_limit`, and `reclaim_all` allocation
+        sources are applicable only when Large Model Support is enabled.
+    """
+
+    device = _get_device_index(device, optional=True)
+    return torch._C._cuda_allocDistribution(device)
+
+def reset_alloc_distribution(device=None):
+    r"""Resets the starting point in tracking the distribution of allocation sources.
+
+    See :func:`~torch.cuda.alloc_distribution` for details.
+
+    Arguments:
+        device (torch.device or int, optional): selected device. Returns
+            statistic for the current device, given by :func:`~torch.cuda.current_device`,
+            if :attr:`device` is ``None`` (default).
+    """
+    device = _get_device_index(device, optional=True)
+    return torch._C._cuda_resetAllocDistribution(device)
+
 def set_enabled_lms(enable):
     r"""Enable/disable Large Model Support.
 
