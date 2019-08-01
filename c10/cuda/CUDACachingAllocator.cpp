@@ -71,11 +71,16 @@ struct DeviceStats {
   uint64_t   amount_inactive;       // total amount in reclaim list in bytes
   uint64_t   amount_active()        { return amount_allocated - amount_inactive; }
   uint64_t   max_amount_active;     // max total active in bytes
+  uint64_t   amount_reclaimed;
+  uint64_t   alloc_distribution[NUM_ALLOC_SOURCES];
 
   DeviceStats() :
       amount_allocated(0), max_amount_allocated(0),
       amount_cached(0), max_amount_cached(0),
-      amount_inactive(0), max_amount_active(0) { }
+      amount_inactive(0), max_amount_active(0),
+      amount_reclaimed(0) {
+    resetAllocStats();
+  }
 
   void increaseAllocated(size_t delta) {
     amount_allocated += delta;
@@ -100,9 +105,22 @@ struct DeviceStats {
     amount_inactive += delta;
   }
 
-  void decreaseInactive(size_t delta) {
+  void decreaseInactive(size_t delta, bool reclaimed=false) {
     amount_inactive -= delta;
     max_amount_active = std::max(max_amount_active, amount_active());
+
+    if (reclaimed)
+      amount_reclaimed += delta;
+  }
+
+  void resetAllocStats() {
+    memset(alloc_distribution, 0, sizeof(alloc_distribution));
+  }
+  void getAllocStats(uint64_t* distribution) {
+    memcpy(distribution, alloc_distribution, sizeof(alloc_distribution));
+  }
+  void recordAllocSource(AllocSource source) {
+    alloc_distribution[source] += 1;
   }
 };
 
@@ -212,6 +230,7 @@ struct AllocParams {
   bool lms_enabled;
   bool limit_alloc;
   Block* block;
+  AllocSource source;
   cudaError_t err;
 };
 
@@ -240,13 +259,14 @@ struct DeviceCachingAllocator
       large_blocks(BlockComparator),
       small_blocks(BlockComparator) {}
 
-  bool get_free_block(AllocParams& p)
+  bool get_free_block(AllocParams& p, AllocSource source)
   {
     BlockPool& pool = *p.pool;
     auto it = pool.lower_bound(&p.search_key);
     if (it == pool.end() || (*it)->stream != p.stream())
       return false;
     p.block = *it;
+    p.source = source;
     pool.erase(it);
     return true;
   }
@@ -260,7 +280,7 @@ struct DeviceCachingAllocator
     return freed_memory;
   }
 
-  bool alloc_block(AllocParams& p, bool record_error)
+  bool alloc_block(AllocParams& p, bool record_error, AllocSource source)
   {
     size_t size = p.alloc_size;
     void* ptr;
@@ -273,6 +293,7 @@ struct DeviceCachingAllocator
 
     stats.increaseCached(size);
     p.block = new Block(p.device(), p.stream(), size, p.pool, (char*)ptr);
+    p.source = source;
     return (p.block != nullptr);
   }
 
@@ -287,13 +308,13 @@ struct DeviceCachingAllocator
 
     bool found =
       // a. Search reclaim list for a suitable inactive allocation
-      (reclaim_one(size, sync_event) && get_free_block(p))
+      (reclaim_one(size, sync_event) && get_free_block(p, RECLAIM_ONE))
       // b. Reclaim fragments of suitable allocations
-      || (reclaim_fragments(size, sync_event) && get_free_block(p))
+      || (reclaim_fragments(size, sync_event) && get_free_block(p, RECLAIM_FRAGMENTS))
       // c. Attempt allocate (if not done earlier due to limit)
-      || (p.limit_alloc && alloc_block(p, false))
+      || (p.limit_alloc && alloc_block(p, false, CUDAMALLOC_OVER_LIMIT))
       // d. Reclaim everything else
-      || (reclaim_all(sync_event) && get_free_block(p));
+      || (reclaim_all(sync_event) && get_free_block(p, RECLAIM_ALL));
 
     C10_CUDA_CHECK(cudaEventDestroy(sync_event));
 
@@ -315,15 +336,15 @@ struct DeviceCachingAllocator
 
     bool block_found =
       // 1. Search pool
-      get_free_block(params)
+      get_free_block(params, FREELIST)
       // 2. Trigger callbacks and retry search
-      || (trigger_free_memory_callbacks(params) && get_free_block(params))
+      || (trigger_free_memory_callbacks(params) && get_free_block(params, FREELIST))
       // 3. Attempt allocate (if not limited by lms settings)
-      || (!params.limit_alloc && alloc_block(params, false))
+      || (!params.limit_alloc && alloc_block(params, false, CUDAMALLOC_UNDER_LIMIT))
       // 4. If LMS enabled, try to reclaim inactive allocations
       || (params.lms_enabled && try_lms_reclaim(params))
       // 5. Free all non-split cached blocks and retry alloc.
-      || (free_cached_blocks() && alloc_block(params, true));
+      || (free_cached_blocks() && alloc_block(params, true, CUDAMALLOC_PURGE));
 
     AT_ASSERT((!block_found && params.err != cudaSuccess) || params.block);
     if (!block_found) {
@@ -387,6 +408,7 @@ struct DeviceCachingAllocator
     block->allocated = true;
 
     stats.increaseAllocated(block->size);
+    stats.recordAllocSource(params.source);
 
     return block;
   }
@@ -673,7 +695,7 @@ struct DeviceCachingAllocator
     if (best == nullptr)
       return false;
 
-    stats.decreaseInactive(best_size);
+    stats.decreaseInactive(best_size, true);
     best->lms_list_remove();
     best->lms_pageout(sync_event);
     best->lms_pageout_sync();
@@ -703,7 +725,7 @@ struct DeviceCachingAllocator
         CUDACachingAllocator::getBaseAllocation(storage->allocation_ptr(), &alloc_size);
         if (alloc_size >= size) {
           size_t storage_size = round_size(storage->capacity());
-          stats.decreaseInactive(storage_size);
+          stats.decreaseInactive(storage_size, true);
           storage->lms_list_remove();
           storage->lms_pageout(sync_event, &iodone_queue);
           count++;
@@ -730,7 +752,7 @@ struct DeviceCachingAllocator
         hook = hook->next();
 
         size_t storage_size = round_size(storage->capacity());
-        stats.decreaseInactive(storage_size);
+        stats.decreaseInactive(storage_size, true);
         storage->lms_list_remove();
         storage->lms_pageout(sync_event, &iodone_queue);
         count++;
@@ -1033,6 +1055,31 @@ void resetMaxMemoryActive(int device) {
   assertValidDevice(device);
   DeviceStats& stats = caching_allocator.device_allocator[device]->stats;
   stats.max_amount_active = stats.amount_active();
+}
+
+uint64_t currentMemoryReclaimed(int device)
+{
+  assertValidDevice(device);
+  return caching_allocator.device_allocator[device]->stats.amount_reclaimed;
+}
+
+void resetMemoryReclaimed(int device) {
+  assertValidDevice(device);
+  DeviceStats& stats = caching_allocator.device_allocator[device]->stats;
+  stats.amount_reclaimed = 0;
+}
+
+void currentAllocDistribution(int device, uint64_t* distribution)
+{
+  assertValidDevice(device);
+  DeviceStats& stats = caching_allocator.device_allocator[device]->stats;
+  stats.getAllocStats(distribution);
+}
+
+void resetAllocDistribution(int device) {
+  assertValidDevice(device);
+  DeviceStats& stats = caching_allocator.device_allocator[device]->stats;
+  stats.resetAllocStats();
 }
 
 void setUserEnabledLMS(bool enable) {

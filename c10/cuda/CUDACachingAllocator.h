@@ -58,6 +58,8 @@ C10_CUDA_API void     resetMaxMemoryCached(int device);
 C10_CUDA_API uint64_t currentMemoryActive(int device);
 C10_CUDA_API uint64_t maxMemoryActive(int device);
 C10_CUDA_API void     resetMaxMemoryActive(int device);
+C10_CUDA_API uint64_t currentMemoryReclaimed(int device);
+C10_CUDA_API void     resetMemoryReclaimed(int device);
 C10_CUDA_API void   setUserEnabledLMS(bool enable);
 C10_CUDA_API bool   userEnabledLMS(void);
 C10_CUDA_API void   setUserSizeLMS(size_t size);
@@ -69,6 +71,20 @@ C10_CUDA_API void reclaimInactive();
 C10_CUDA_API std::mutex* getFreeMutex();
 
 C10_CUDA_API std::shared_ptr<void> getIpcDevPtr(std::string handle);
+
+enum AllocSource {
+  FREELIST,
+  CUDAMALLOC_UNDER_LIMIT,
+  RECLAIM_ONE,
+  RECLAIM_FRAGMENTS,
+  CUDAMALLOC_OVER_LIMIT,
+  RECLAIM_ALL,
+  CUDAMALLOC_PURGE,
+  NUM_ALLOC_SOURCES
+};
+
+C10_CUDA_API void currentAllocDistribution(int device, uint64_t* distribution);
+C10_CUDA_API void resetAllocDistribution(int device);
 
 } // namespace CUDACachingAllocator
 

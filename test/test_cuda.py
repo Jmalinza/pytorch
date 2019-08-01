@@ -2872,11 +2872,20 @@ class TestCuda(TestCase):
             torch.cuda.set_limit_lms(0 if zero else 1024*1024*1024)
             tensors = [alloc(32), alloc(128), alloc(10, 1024, 1024)]
             allocated = torch.cuda.memory_allocated(device)
+            reclaimed = torch.cuda.memory_reclaimed(device)
+            dist_before = torch.cuda.alloc_distribution(device)
             tensors.append(alloc(10, 1024, 1024))
+            dist_after = torch.cuda.alloc_distribution(device)
             if zero:
                 self.assertEqual(torch.cuda.memory_allocated(device), allocated)
+                self.assertGreater(torch.cuda.memory_reclaimed(device), reclaimed)
+                self.assertEqual(dist_after['cudamalloc'], dist_before['cudamalloc'])
+                self.assertGreater(dist_after['reclaim_one'], dist_before['reclaim_one'])
             else:
                 self.assertGreater(torch.cuda.memory_allocated(device), allocated)
+                self.assertEqual(torch.cuda.memory_reclaimed(device), reclaimed)
+                self.assertGreater(dist_after['cudamalloc'], dist_before['cudamalloc'])
+                self.assertEqual(dist_after['reclaim_one'], dist_before['reclaim_one'])
             del tensors
 
         _test_lms_limit(zero=True)
@@ -2913,7 +2922,9 @@ class TestCuda(TestCase):
         cached = torch.cuda.memory_cached(device)
         allocated = torch.cuda.memory_allocated(device)
         active = torch.cuda.memory_active(device)
+        reclaimed = torch.cuda.memory_reclaimed(device)
         torch.cuda.reclaim_inactive()
+        self.assertGreater(torch.cuda.memory_reclaimed(device), reclaimed)
         self.assertEqual(active, torch.cuda.memory_active(device))
         self.assertEqual(cached, torch.cuda.memory_cached(device))
         self.assertGreater(allocated, torch.cuda.memory_allocated(device))
@@ -2922,10 +2933,16 @@ class TestCuda(TestCase):
         #    Access tensors again
         #    assert(tensor data is preserved during reclaim)
         #    assert(allocated been restored && active/cached are still unchanged)
-        self.assertEqual(sums, list(map(torch.sum, tensors)))
+        dist_before = torch.cuda.alloc_distribution(device)
+        sums2 = list(map(torch.sum, tensors))
+        dist_after = torch.cuda.alloc_distribution(device)
+        self.assertEqual(sums, sums2)
+        del sums2
         self.assertEqual(active, torch.cuda.memory_active(device))
         self.assertEqual(cached, torch.cuda.memory_cached(device))
         self.assertEqual(allocated, torch.cuda.memory_allocated(device))
+        self.assertGreater(dist_after['freelist'], dist_before['freelist'])
+        self.assertEqual(dist_after['cudamalloc'], dist_before['cudamalloc'])
         del sums
         del tensors
 
