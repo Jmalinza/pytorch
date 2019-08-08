@@ -50,7 +50,7 @@ ${return_type} ${api_name}(${type_method_formals}) {
 #ifdef BUILD_NAMEDTENSOR
     ${named_guard_declaration}
 #endif
-    ${device_guard_declaration}
+    ${device_guard_declarations}
     Tensor ${broadcast_returns};
     std::tie(${broadcast_returns}) = ${broadcast_function}(${broadcast_actuals}, "${api_name}");
     return ${method_prefix_derived}${api_name}(${broadcast_modified_actuals});
@@ -65,7 +65,7 @@ ${return_type} ${method_prefix_derived}${api_name}(${type_method_formals}) {
 #ifdef BUILD_NAMEDTENSOR
     ${named_guard_declaration}
 #endif
-    ${device_guard_declaration}
+    ${device_guard_declarations}
     ${type_definition_body}
 }
 """)
@@ -97,7 +97,7 @@ ${return_type} TypeDefault::${api_name}(${type_method_formals}) {
 #ifdef BUILD_NAMEDTENSOR
     ${named_guard_declaration}
 #endif
-    ${device_guard_declaration}
+    ${device_guard_declarations}
     ${return_call} at::native::${native_type_method_dispatch}(${native_actuals});
 }
 """)
@@ -107,7 +107,7 @@ ${return_type} ${Type}::${api_name}(${type_method_formals}) {
 #ifdef BUILD_NAMEDTENSOR
     ${named_guard_declaration}
 #endif
-    ${device_guard_declaration}
+    ${device_guard_declarations}
     ${return_call} at::native::${native_type_method_dispatch}(${native_actuals});
 }
 """)
@@ -511,7 +511,7 @@ FunctionOption = TypedDict('FunctionOption', {
     'condition': str,
     'const_mark': str,
     'device_guard': bool,
-    'device_guard_declaration': str,
+    'device_guard_declarations': List[str],
     'dispatch_scalar_type_declaration': str,
     'with_gil': bool,
     'cpu_half': bool,
@@ -592,14 +592,18 @@ FunctionCode = NamedTuple('FunctionCode', [
 ])
 
 
-def device_guard(option, dispatch_options, dispatch_tensor):
+def device_guards(option, dispatch_options, dispatch_tensor, formals):
     # For factory methods the `DeviceGuard` is already in the template.
     if option.get('device_guard', True):
+        code = []
         if dispatch_options:
-            return 'const DeviceGuard device_guard({}.device());'.format(dispatch_options['name'])
-        if dispatch_tensor:
-            return 'const OptionalDeviceGuard device_guard(device_of({}));'.format(dispatch_tensor)
-    return '// DeviceGuard omitted'
+            code.append('const DeviceGuard device_guard({}.device());'.format(dispatch_options['name']))
+        elif dispatch_tensor:
+            code.append('const OptionalDeviceGuard device_guard(device_of({}));'.format(dispatch_tensor))
+        for arg in [f for f in formals if f['dynamic_type'] in {'Tensor', 'TensorList'}]:
+            code.append('const {0}Guard {1}_tensor_guard({1});'.format(arg['dynamic_type'], arg['name']))
+        return code
+    return ['// DeviceGuard omitted']
 
 
 def named_guard(option, tensors, tensorlists):
@@ -869,6 +873,7 @@ def create_generic(top_env, declarations):
             # arguments list between output and input arguments
             for buffer in option['buffers']:
                 body.append('Tensor {} = at::empty({{0}}, this->options());'.format(buffer['name']))
+                body.append('const TensorGuard {0}_tensor_guard({0});'.format(buffer['name']))
             actuals = [arg['name'] for arg in option['arguments'] if arg.get('output')]
             actuals += [buffer['name'] for buffer in option['buffers']]
             actuals += [arg['name'] for arg in option['arguments'] if not arg.get('output')]
@@ -914,7 +919,7 @@ def create_generic(top_env, declarations):
         option['method_prefix_derived'] = '' if broadcast_arg is None else 's_'
         if option['mode'] == 'TH':
             option['device_guard'] = False
-        option['device_guard_declaration'] = device_guard(option, False, dispatch_tensor)
+        option['device_guard_declarations'] = device_guards(option, False, dispatch_tensor, formals)
         option['named_guard_declaration'] = named_guard(option, find_tensors(formals),
                                                         find_tensorlists(formals))
         option['dispatch_scalar_type_declaration'] = dispatch_scalar_type(option, False, dispatch_tensor)
@@ -1132,7 +1137,7 @@ def create_generic(top_env, declarations):
         check_methods_do_not_start_with_underscore(option['name'], is_method)
 
         option['method_prefix_derived'] = ''
-        option['device_guard_declaration'] = device_guard(option, dispatch_options, dispatch_tensor)
+        option['device_guard_declarations'] = device_guards(option, dispatch_options, dispatch_tensor, formals)
         option['named_guard_declaration'] = named_guard(option, find_tensors(formals),
                                                         find_tensorlists(formals))
         option['dispatch_scalar_type_declaration'] = dispatch_scalar_type(option, dispatch_options, dispatch_tensor)
@@ -1356,10 +1361,14 @@ def create_derived(backend_type_env, declarations):
             tensor_arg = ('{}_ == nullptr ? (TensorImpl*)UndefinedTensorImpl::singleton() : (TensorImpl*){}_'
                           .format(name, name))
         intrusive_ptr_type = 'c10::intrusive_ptr<TensorImpl, UndefinedTensorImpl>'
-        return [
+        code = [
             'auto {}_ = {};'.format(name, allocation),
             'auto {} = Tensor({}::reclaim({}));'.format(name, intrusive_ptr_type, tensor_arg),
         ]
+        if is_cuda:
+            code.append('const TensorGuard {0}_tensor_guard({0});'.format(name))
+        return code
+
 
     def resize_arg(arg):
         # type: (THFormal) -> str

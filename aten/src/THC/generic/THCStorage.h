@@ -17,13 +17,13 @@
 #define THCudaBoolStorage       THCStorage
 #define THCudaBFloat16Storage   THCStorage
 
-THC_API scalar_t* THCStorage_(data)(THCState *state, const THCStorage*);
+THC_API scalar_t* THCStorage_(data)(THCState *state, THCStorage*);
 THC_API ptrdiff_t THCStorage_(size)(THCState *state, const THCStorage*);
 THC_API int THCStorage_(elementSize)(THCState *state);
 
 /* slow access -- checks everything */
 THC_API void THCStorage_(set)(THCState *state, THCStorage*, ptrdiff_t, scalar_t);
-THC_API scalar_t THCStorage_(get)(THCState *state, const THCStorage*, ptrdiff_t);
+THC_API scalar_t THCStorage_(get)(THCState *state, THCStorage*, ptrdiff_t);
 
 THC_API THCStorage* THCStorage_(new)(THCState *state);
 THC_API THCStorage* THCStorage_(newWithSize)(THCState *state, ptrdiff_t size);

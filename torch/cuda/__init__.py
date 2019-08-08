@@ -562,6 +562,181 @@ def reset_max_memory_cached(device=None):
     return torch._C._cuda_resetMaxMemoryCached(device)
 
 
+def memory_active(device=None):
+    r"""Returns the current GPU memory occupied by active tensors in bytes for a given
+    device.
+
+    Arguments:
+        device (torch.device or int, optional): selected device. Returns
+            statistic for the current device, given by :func:`~torch.cuda.current_device`,
+            if :attr:`device` is ``None`` (default).
+
+    .. note::
+        When Large Model Support is enabled, this should be less than the total amount of
+        GPU memory occupied by tensors.
+    """
+    device = _get_device_index(device, optional=True)
+    return torch._C._cuda_memoryActive(device)
+
+
+def max_memory_active(device=None):
+    r"""Returns the maximum GPU memory occupied by active tensors in bytes for a given
+    device.
+
+    By default, this returns the peak active memory since the beginning of
+    this program. :func:`~torch.cuda.reset_max_memory_active` can be used to
+    reset the starting point in tracking this metric. For example, these two
+    functions can measure the peak active memory usage of each iteration in a
+    training loop.
+
+    Arguments:
+        device (torch.device or int, optional): selected device. Returns
+            statistic for the current device, given by :func:`~torch.cuda.current_device`,
+            if :attr:`device` is ``None`` (default).
+    """
+    device = _get_device_index(device, optional=True)
+    return torch._C._cuda_maxMemoryActive(device)
+
+
+def reset_max_memory_active(device=None):
+    r"""Resets the starting point in tracking maximum GPU memory occupied by
+    active tensors for a given device.
+
+    See :func:`~torch.cuda.max_memory_allocated` for details.
+
+    Arguments:
+        device (torch.device or int, optional): selected device. Returns
+            statistic for the current device, given by :func:`~torch.cuda.current_device`,
+            if :attr:`device` is ``None`` (default).
+    """
+    device = _get_device_index(device, optional=True)
+    return torch._C._cuda_resetMaxMemoryActive(device)
+
+
+def memory_reclaimed(device=None):
+    r"""Returns the total GPU memory transferred to the host by Large Model Support
+    in bytes for a given device.
+
+    Arguments:
+        device (torch.device or int, optional): selected device. Returns
+            statistic for the current device, given by :func:`~torch.cuda.current_device`,
+            if :attr:`device` is ``None`` (default).
+
+    .. note::
+        This will be non-zero only when Large Model Support is enabled.
+    """
+    device = _get_device_index(device, optional=True)
+    return torch._C._cuda_memoryReclaimed(device)
+
+def reset_memory_reclaimed(device=None):
+    r"""Resets the starting point in tracking the total GPU memory transfered to the host
+    by Large Model Support.
+
+    See :func:`~torch.cuda.memory_reclaimed` for details.
+
+    Arguments:
+        device (torch.device or int, optional): selected device. Returns
+            statistic for the current device, given by :func:`~torch.cuda.current_device`,
+            if :attr:`device` is ``None`` (default).
+    """
+    device = _get_device_index(device, optional=True)
+    return torch._C._cuda_resetMemoryReclaimed(device)
+
+def alloc_distribution(device=None):
+    r"""Returns a histogram (encoded as a python dictionary) showing the distribution of allocation
+    sources for a given device.  Each allocation satisfied by the CUDA Caching Allocator is retrieved
+    from a particular source.  The allocation distribution counts the number of allocations satisfied
+    from each source.
+
+    The set of possible sources are:
+
+    * `'freelist'`
+    * `'cudamalloc'`
+    * `'reclaim_one'`
+    * `'reclaim_fragments'`
+    * `'cudamalloc_over_limit'`
+    * `'reclaim_all'`
+    * `'cudamalloc_purge'`
+
+    Arguments:
+        device (torch.device or int, optional): selected device. Returns
+            statistic for the current device, given by :func:`~torch.cuda.current_device`,
+            if :attr:`device` is ``None`` (default).
+
+    .. note::
+        The `reclaim_one`, `reclaim_fragments`, `cudamalloc_over_limit`, and `reclaim_all` allocation
+        sources are applicable only when Large Model Support is enabled.
+    """
+
+    device = _get_device_index(device, optional=True)
+    return torch._C._cuda_allocDistribution(device)
+
+def reset_alloc_distribution(device=None):
+    r"""Resets the starting point in tracking the distribution of allocation sources.
+
+    See :func:`~torch.cuda.alloc_distribution` for details.
+
+    Arguments:
+        device (torch.device or int, optional): selected device. Returns
+            statistic for the current device, given by :func:`~torch.cuda.current_device`,
+            if :attr:`device` is ``None`` (default).
+    """
+    device = _get_device_index(device, optional=True)
+    return torch._C._cuda_resetAllocDistribution(device)
+
+def set_enabled_lms(enable):
+    r"""Enable/disable Large Model Support.
+
+    Arguments:
+        enable (bool): desired LMS setting.
+    """
+    torch._C._cuda_setEnabledLMS(enable)
+
+
+def get_enabled_lms():
+    r"""Returns a bool indicating if Large Model Support is currently enabled."""
+    return torch._C._cuda_getEnabledLMS()
+
+
+def set_size_lms(size):
+    r"""Mininum size (in bytes) for LMS.
+
+    Arguments:
+        size (integer): Any memory block larger than this will be subject to LMS optimization.
+    """
+    torch._C._cuda_setSizeLMS(size)
+
+
+def get_size_lms():
+    r"""Returns the minimum size (in bytes) for LMS."""
+    return torch._C._cuda_getSizeLMS()
+
+
+def set_limit_lms(limit):
+    r"""Allocation limit (in bytes) for LMS.
+
+    Arguments:
+        limit (integer): LMS limit on device memory.
+    """
+    torch._C._cuda_setLimitLMS(limit)
+
+
+def get_limit_lms():
+    r"""Returns the limit (in bytes) for LMS."""
+    return torch._C._cuda_getLimitLMS()
+
+
+def reclaim_inactive():
+    r"""Swaps the memory of all inactive tensors out to the host so that those can be returned
+    to the caching allocator.
+
+    .. note::
+        The set of inactive tensors is maintained only when Large Model Support is enabled.
+    """
+    if _initialized:
+        torch._C._cuda_reclaimInactive()
+
+
 def _host_allocator():
     _lazy_init()
     return torch._C._cuda_cudaHostAllocator()

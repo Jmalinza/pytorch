@@ -5,7 +5,7 @@
 #include <c10/util/intrusive_ptr.h>
 #include <c10/util/typeid.h>
 
-scalar_t* THCStorage_(data)(THCState *state, const THCStorage *self)
+scalar_t* THCStorage_(data)(THCState *state, THCStorage *self)
 {
   return self->data<scalar_t>();
 }
@@ -30,7 +30,7 @@ void THCStorage_(set)(THCState *state, THCStorage *self, ptrdiff_t index, scalar
   THCudaCheck(cudaStreamSynchronize(stream));
 }
 
-scalar_t THCStorage_(get)(THCState *state, const THCStorage *self, ptrdiff_t index)
+scalar_t THCStorage_(get)(THCState *state, THCStorage *self, ptrdiff_t index)
 {
   THArgCheck((index >= 0) && (index < self->numel()), 2, "index out of bounds");
   scalar_t value;

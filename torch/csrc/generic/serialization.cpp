@@ -20,7 +20,7 @@ void THPStorage_(writeFileRaw)(THWStorage *self, io fd)
 #else
   std::unique_ptr<char[]> cpu_data(new char[size * sizeof(scalar_t)]);
   data = (scalar_t*)cpu_data.get();
-  THCudaCheck(cudaMemcpy(data, THWStorage_(data)(LIBRARY_STATE self), size * sizeof(scalar_t), cudaMemcpyDeviceToHost));
+  THCStorage_copy_to_host(LIBRARY_STATE self, data);
 #endif
   doWrite(fd, &size, sizeof(int64_t));
   // fast track for bytes and little endian
