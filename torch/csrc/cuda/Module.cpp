@@ -264,6 +264,8 @@ PyObject * THCPModule_memoryStats(PyObject *_unused, PyObject *arg)
   using c10::cuda::CUDACachingAllocator::StatType;
   using c10::cuda::CUDACachingAllocator::Stat;
   using c10::cuda::CUDACachingAllocator::StatArray;
+  using c10::cuda::CUDACachingAllocator::AllocSource;
+  using c10::cuda::CUDACachingAllocator::AllocSourceArray;
   using c10::cuda::CUDACachingAllocator::DeviceStats;
 
   const auto statToDict = [](const Stat& stat) {
@@ -287,6 +289,18 @@ PyObject * THCPModule_memoryStats(PyObject *_unused, PyObject *arg)
     return dict;
   };
 
+  const auto allocSourceArrayToDict = [](const AllocSourceArray& allocSourceArray) {
+    const std::array<const char*, static_cast<size_t>(AllocSource::NUM_ALLOC_SOURCES)> allocSourceNames = {
+        "freelist", "cudamalloc", "reclaim_one", "reclaim_fragments", "cudamalloc_over_limit",
+        "reclaim_all", "cudamalloc_retry"
+    };
+    py::dict dict;
+    for (size_t i = 0; i < allocSourceNames.size(); ++i) {
+      dict[allocSourceNames[i]] = allocSourceArray[i];
+    }
+    return dict;
+  };
+
   const DeviceStats stats = c10::cuda::CUDACachingAllocator::getDeviceStats(device);
 
   py::dict result;
@@ -300,6 +314,13 @@ PyObject * THCPModule_memoryStats(PyObject *_unused, PyObject *arg)
   result["reserved_bytes"] = statArrayToDict(stats.reserved_bytes);
   result["active_bytes"] = statArrayToDict(stats.active_bytes);
   result["inactive_split_bytes"] = statArrayToDict(stats.inactive_split_bytes);
+  result["alloc_distribution"] = allocSourceArrayToDict(stats.alloc_distribution);
+
+  // LMS stats
+  result["pinned"] = statArrayToDict(stats.pinned);
+  result["pinned_bytes"] = statArrayToDict(stats.pinned_bytes);
+  result["reclaimed"] = stats.reclaimed;
+  result["reclaimed_bytes"] = stats.reclaimed_bytes;
 
   return result.release().ptr();
   END_HANDLE_TH_ERRORS
@@ -362,6 +383,66 @@ PyObject * THCPModule_memorySnapshot(PyObject *_unused, PyObject *noargs)
 
   return result.release().ptr();
   END_HANDLE_TH_ERRORS
+}
+
+PyObject *THCPModule_setUserEnabledLMS(PyObject *_unused, PyObject *arg)
+{
+  HANDLE_TH_ERRORS
+  THPUtils_assert(PyBool_Check(arg), "set_enabled_lms expects a bool, "
+          "but got %s", THPUtils_typename(arg));
+  c10::cuda::CUDACachingAllocator::setUserEnabledLMS(arg == Py_True);
+  Py_RETURN_NONE;
+  END_HANDLE_TH_ERRORS
+}
+
+PyObject *THCPModule_userEnabledLMS(PyObject *_unused)
+{
+  HANDLE_TH_ERRORS
+  if (c10::cuda::CUDACachingAllocator::userEnabledLMS()) Py_RETURN_TRUE;
+  else Py_RETURN_FALSE;
+  END_HANDLE_TH_ERRORS
+}
+
+PyObject *THCPModule_setUserSizeLMS(PyObject *_unused, PyObject *arg)
+{
+  HANDLE_TH_ERRORS
+  THPUtils_assert(THPUtils_checkLong(arg), "invalid argument to set_size_lms");
+  size_t size = THPUtils_unpackLong(arg);
+  c10::cuda::CUDACachingAllocator::setUserSizeLMS(size);
+  Py_RETURN_NONE;
+  END_HANDLE_TH_ERRORS
+}
+
+PyObject *THCPModule_userSizeLMS(PyObject *_unused)
+{
+  HANDLE_TH_ERRORS
+  return PyLong_FromLong(c10::cuda::CUDACachingAllocator::userSizeLMS());
+  END_HANDLE_TH_ERRORS
+}
+
+PyObject *THCPModule_setUserLimitLMS(PyObject *_unused, PyObject *arg)
+{
+  HANDLE_TH_ERRORS
+  THPUtils_assert(THPUtils_checkLong(arg), "invalid argument to set_limit_lms");
+  size_t limit = THPUtils_unpackLong(arg);
+  c10::cuda::CUDACachingAllocator::setUserLimitLMS(limit);
+  Py_RETURN_NONE;
+  END_HANDLE_TH_ERRORS
+}
+
+PyObject *THCPModule_userLimitLMS(PyObject *_unused)
+{
+  HANDLE_TH_ERRORS
+  return PyLong_FromLong(c10::cuda::CUDACachingAllocator::userLimitLMS());
+  END_HANDLE_TH_ERRORS
+}
+
+PyObject * THCPModule_reclaimInactive(PyObject *_unused)
+{
+  HANDLE_TH_ERRORS
+  c10::cuda::CUDACachingAllocator::reclaimInactive();
+  END_HANDLE_TH_ERRORS
+  Py_RETURN_NONE;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -486,6 +567,13 @@ static struct PyMethodDef _THCPModule_methods[] = {
   {"_cuda_resetAccumulatedMemoryStats", (PyCFunction) THCPModule_resetAccumulatedMemoryStats, METH_O, nullptr},
   {"_cuda_resetPeakMemoryStats", (PyCFunction) THCPModule_resetPeakMemoryStats, METH_O,  nullptr},
   {"_cuda_memorySnapshot", (PyCFunction) THCPModule_memorySnapshot, METH_NOARGS, nullptr},
+  {"_cuda_getEnabledLMS", (PyCFunction)THCPModule_userEnabledLMS, METH_NOARGS, nullptr},
+  {"_cuda_setEnabledLMS", (PyCFunction)THCPModule_setUserEnabledLMS, METH_O,   nullptr},
+  {"_cuda_getSizeLMS", (PyCFunction)THCPModule_userSizeLMS, METH_NOARGS,       nullptr},
+  {"_cuda_setSizeLMS", (PyCFunction)THCPModule_setUserSizeLMS, METH_O,         nullptr},
+  {"_cuda_getLimitLMS", (PyCFunction)THCPModule_userLimitLMS, METH_NOARGS,     nullptr},
+  {"_cuda_setLimitLMS", (PyCFunction)THCPModule_setUserLimitLMS, METH_O,       nullptr},
+  {"_cuda_reclaimInactive", (PyCFunction) THCPModule_reclaimInactive, METH_NOARGS,  nullptr},
   {"_cuda_cudaHostAllocator", (PyCFunction)THCPModule_cudaHostAllocator, METH_NOARGS, nullptr},
   {"_cuda_synchronize", (PyCFunction)THCPModule_cudaSynchronize, METH_NOARGS, nullptr},
   {"_cuda_ipc_collect", (PyCFunction)THCPModule_cudaIPCCollect, METH_NOARGS, nullptr},
