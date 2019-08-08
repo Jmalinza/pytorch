@@ -3,6 +3,7 @@
 
 #include <c10/cuda/CUDAStream.h>
 #include <c10/core/Allocator.h>
+#include <c10/core/StorageImpl.h>
 #include <c10/cuda/CUDAMacros.h>
 #include <c10/util/Registry.h>
 
@@ -43,6 +44,7 @@ C10_CUDA_API void* raw_alloc(size_t nbytes);
 C10_CUDA_API void raw_delete(void* ptr);
 
 C10_CUDA_API Allocator* get();
+C10_CUDA_API void init(int device_count, at::Allocator* host_allocator);
 C10_CUDA_API void emptyCache();
 C10_CUDA_API void cacheInfo(int dev_id, size_t* cachedAndFree, size_t* largestBlock);
 C10_CUDA_API void* getBaseAllocation(void *ptr, size_t *size);
@@ -53,10 +55,36 @@ C10_CUDA_API void     resetMaxMemoryAllocated(int device);
 C10_CUDA_API uint64_t currentMemoryCached(int device);
 C10_CUDA_API uint64_t maxMemoryCached(int device);
 C10_CUDA_API void     resetMaxMemoryCached(int device);
+C10_CUDA_API uint64_t currentMemoryActive(int device);
+C10_CUDA_API uint64_t maxMemoryActive(int device);
+C10_CUDA_API void     resetMaxMemoryActive(int device);
+C10_CUDA_API uint64_t currentMemoryReclaimed(int device);
+C10_CUDA_API void     resetMemoryReclaimed(int device);
+C10_CUDA_API void   setUserEnabledLMS(bool enable);
+C10_CUDA_API bool   userEnabledLMS(void);
+C10_CUDA_API void   setUserSizeLMS(size_t size);
+C10_CUDA_API size_t userSizeLMS(void);
+C10_CUDA_API void   setUserLimitLMS(size_t limit);
+C10_CUDA_API size_t userLimitLMS(void);
+C10_CUDA_API void reclaimInactive();
 
 C10_CUDA_API std::mutex* getFreeMutex();
 
 C10_CUDA_API std::shared_ptr<void> getIpcDevPtr(std::string handle);
+
+enum AllocSource {
+  FREELIST,
+  CUDAMALLOC_UNDER_LIMIT,
+  RECLAIM_ONE,
+  RECLAIM_FRAGMENTS,
+  CUDAMALLOC_OVER_LIMIT,
+  RECLAIM_ALL,
+  CUDAMALLOC_PURGE,
+  NUM_ALLOC_SOURCES
+};
+
+C10_CUDA_API void currentAllocDistribution(int device, uint64_t* distribution);
+C10_CUDA_API void resetAllocDistribution(int device);
 
 } // namespace CUDACachingAllocator
 

@@ -4,7 +4,7 @@
 
 #include <new>
 
-scalar_t* THStorage_(data)(const THStorage *self)
+scalar_t* THStorage_(data)(THStorage *self)
 {
 #if defined(THQUANTIZED)
   return reinterpret_cast<scalar_t*>(self->data<quantized_t>());
@@ -162,7 +162,7 @@ void THStorage_(set)(THStorage *self, ptrdiff_t idx, scalar_t value)
   THStorage_(data)(self)[idx] = value;
 }
 
-scalar_t THStorage_(get)(const THStorage *self, ptrdiff_t idx)
+scalar_t THStorage_(get)(THStorage *self, ptrdiff_t idx)
 {
   THArgCheck((idx >= 0) && (idx < self->numel()), 2, "out of bounds");
   return THStorage_(data)(self)[idx];
