@@ -461,17 +461,22 @@ def get_enabled_lms():
 
 
 def set_size_lms(size):
-    r"""Mininum size (in bytes) for LMS.
+    r"""Deprecated;  Mininum size (in bytes) for LMS.
 
     Arguments:
         size (integer): Any memory block larger than this will be subject to LMS optimization.
     """
-    torch._C._cuda_setSizeLMS(size)
+    warnings.warn(
+        "torch.cuda.set_size_lms has been deprecated.  All blocks are now subject to LMS optimization",
+        DeprecationWarning)
 
 
 def get_size_lms():
-    r"""Returns the minimum size (in bytes) for LMS."""
-    return torch._C._cuda_getSizeLMS()
+    r"""Deprecated;  Returns the minimum size (in bytes) for LMS."""
+    warnings.warn(
+        "torch.cuda.get_size_lms has been deprecated.  All blocks are now subject to LMS optimization",
+        DeprecationWarning)
+    return 0
 
 
 def set_limit_lms(limit):

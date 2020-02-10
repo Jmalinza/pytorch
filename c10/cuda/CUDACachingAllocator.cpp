@@ -157,24 +157,16 @@ static std::string format_size(uint64_t size) {
   return os.str();
 }
 
-#define LMS_SIZE_DEFAULT (1 << 20) // 1 MB
-
 struct LMSSettings {
   LMSSettings() :
-    enabled_(false), size_(LMS_SIZE_DEFAULT), limit_(0), host_allocator_(nullptr) {}
+    enabled_(false), limit_(0), host_allocator_(nullptr) {}
 
   bool enabled()                 { return enabled_; }
   void set_enabled(bool enabled) { enabled_ = enabled; }
-  size_t size()                  { return size_; }
-  void set_size(size_t size)     { size_ = size; }
   size_t limit()                 { return limit_; }
   void set_limit(size_t limit)   { limit_ = limit; }
   at::Allocator* host_allocator()                        { return host_allocator_; }
   void set_host_allocator(at::Allocator* host_allocator) { host_allocator_ = host_allocator; }
-
-  bool enabled(size_t size) {
-    return enabled_ && size >= size_;
-  }
   bool limit_alloc(DeviceStats& stats, size_t alloc_size) {
     auto reserved = stats.reserved_bytes[static_cast<size_t>(StatType::AGGREGATE)].current;
     return (reserved + alloc_size) > limit_;
@@ -182,7 +174,6 @@ struct LMSSettings {
 
 private:
   bool enabled_;
-  size_t size_;
   size_t limit_;
   at::Allocator* host_allocator_;
 };
@@ -193,7 +184,7 @@ struct AllocParams {
     search_key(device, stream, size),
     pool(pool),
     alloc_size(alloc_size),
-    lms_enabled(lms->enabled(size)),
+    lms_enabled(lms->enabled()),
     limit_alloc(lms_enabled && lms->limit_alloc(stats, alloc_size)),
     block(nullptr),
     err(cudaSuccess) {}
@@ -1153,13 +1144,10 @@ CudaLmsStorageImpl::CudaLmsStorageImpl(at::StorageImpl* storage) :
   block_(nullptr), stream_(LMS_INVALID_STREAM) {}
 
 void CudaLmsStorageImpl::reclaim_list_add() {
-  if (capacity() == 0)
-    return;
-  Block* block = caching_allocator.get_allocated_block(ptr());
-  if (!caching_allocator.lms_settings.enabled(block->size))
-    return;
-  block_ = block;
-  caching_allocator.device_allocator[device().index()]->reclaim_list_add(this);
+  if (capacity() > 0) {
+    block_ = caching_allocator.get_allocated_block(ptr());
+    caching_allocator.device_allocator[device().index()]->reclaim_list_add(this);
+  }
 }
 
 bool CudaLmsStorageImpl::reclaim_list_remove() {
@@ -1255,14 +1243,6 @@ void setUserEnabledLMS(bool enable) {
 
 bool userEnabledLMS(void) {
   return caching_allocator.lms_settings.enabled();
-}
-
-void setUserSizeLMS(size_t size) {
-  caching_allocator.lms_settings.set_size(size);
-}
-
-size_t userSizeLMS(void) {
-  return caching_allocator.lms_settings.size();
 }
 
 void setUserLimitLMS(size_t limit) {

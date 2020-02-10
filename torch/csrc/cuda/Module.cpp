@@ -403,23 +403,6 @@ PyObject *THCPModule_userEnabledLMS(PyObject *_unused)
   END_HANDLE_TH_ERRORS
 }
 
-PyObject *THCPModule_setUserSizeLMS(PyObject *_unused, PyObject *arg)
-{
-  HANDLE_TH_ERRORS
-  THPUtils_assert(THPUtils_checkLong(arg), "invalid argument to set_size_lms");
-  size_t size = THPUtils_unpackLong(arg);
-  c10::cuda::CUDACachingAllocator::setUserSizeLMS(size);
-  Py_RETURN_NONE;
-  END_HANDLE_TH_ERRORS
-}
-
-PyObject *THCPModule_userSizeLMS(PyObject *_unused)
-{
-  HANDLE_TH_ERRORS
-  return PyLong_FromLong(c10::cuda::CUDACachingAllocator::userSizeLMS());
-  END_HANDLE_TH_ERRORS
-}
-
 PyObject *THCPModule_setUserLimitLMS(PyObject *_unused, PyObject *arg)
 {
   HANDLE_TH_ERRORS
@@ -569,8 +552,6 @@ static struct PyMethodDef _THCPModule_methods[] = {
   {"_cuda_memorySnapshot", (PyCFunction) THCPModule_memorySnapshot, METH_NOARGS, nullptr},
   {"_cuda_getEnabledLMS", (PyCFunction)THCPModule_userEnabledLMS, METH_NOARGS, nullptr},
   {"_cuda_setEnabledLMS", (PyCFunction)THCPModule_setUserEnabledLMS, METH_O,   nullptr},
-  {"_cuda_getSizeLMS", (PyCFunction)THCPModule_userSizeLMS, METH_NOARGS,       nullptr},
-  {"_cuda_setSizeLMS", (PyCFunction)THCPModule_setUserSizeLMS, METH_O,         nullptr},
   {"_cuda_getLimitLMS", (PyCFunction)THCPModule_userLimitLMS, METH_NOARGS,     nullptr},
   {"_cuda_setLimitLMS", (PyCFunction)THCPModule_setUserLimitLMS, METH_O,       nullptr},
   {"_cuda_reclaimInactive", (PyCFunction) THCPModule_reclaimInactive, METH_NOARGS,  nullptr},

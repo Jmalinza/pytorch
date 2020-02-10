@@ -142,8 +142,6 @@ C10_CUDA_API void resetPeakStats(int device);
 C10_CUDA_API std::vector<SegmentInfo> snapshot();
 C10_CUDA_API void   setUserEnabledLMS(bool enable);
 C10_CUDA_API bool   userEnabledLMS(void);
-C10_CUDA_API void   setUserSizeLMS(size_t size);
-C10_CUDA_API size_t userSizeLMS(void);
 C10_CUDA_API void   setUserLimitLMS(size_t limit);
 C10_CUDA_API size_t userLimitLMS(void);
 C10_CUDA_API void reclaimInactive();
