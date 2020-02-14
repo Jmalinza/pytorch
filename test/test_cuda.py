@@ -2111,15 +2111,15 @@ t2.start()
         _test_lms_enabled(enabled=True)
 
         # 3. Test LMS Limit Swap
-        #    LMS On, limit 0 / alloc multiple small and large / record memory stats / alloc large
+        #    LMS On, limit low / alloc multiple small and large / record memory stats / alloc large
         #    assert(allocated is unchanged)
         # 4. Test LMS Limit Alloc
         #    LMS On, limit high / alloc multiple small and large / record memory stats / alloc large
         #    assert(allocated has increased)
-        def _test_lms_limit(zero):
+        def _test_lms_limit(low):
             stats = []
             torch.cuda.empty_cache()
-            torch.cuda.set_limit_lms(0 if zero else 1024*1024*1024)
+            torch.cuda.set_limit_lms(80*1024*1024 if low else 1024*1024*1024)
             tensors = [alloc(32), alloc(128), alloc(10, 1024, 1024)]
             stats.append(torch.cuda.memory_stats(device))
             tensors.append(alloc(10, 1024, 1024))
@@ -2128,7 +2128,7 @@ t2.start()
             reclaimed = collect_stat(stats, "reclaimed_bytes")
             malloc_calls = collect_stat(stats, "alloc_distribution.cudamalloc")
             reclaim_calls = collect_stat(stats, "alloc_distribution.reclaim_one")
-            if zero:
+            if low:
                 self.assertEqual(allocated[1], allocated[0])
                 self.assertGreater(reclaimed[1], reclaimed[0])
                 self.assertEqual(malloc_calls[1], malloc_calls[0])
@@ -2140,8 +2140,8 @@ t2.start()
                 self.assertEqual(reclaim_calls[1], reclaim_calls[0])
             del tensors
 
-        _test_lms_limit(zero=True)
-        _test_lms_limit(zero=False)
+        _test_lms_limit(low=True)
+        _test_lms_limit(low=False)
         torch.cuda.set_limit_lms(default_limit)
 
         # 5. Test LMS Page-out

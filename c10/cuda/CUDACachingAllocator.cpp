@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <ostream>
 
 namespace c10 {
 
@@ -167,12 +168,22 @@ struct LMSSettings {
   void set_limit(size_t limit)   { limit_ = limit; }
   at::Allocator* host_allocator()                        { return host_allocator_; }
   void set_host_allocator(at::Allocator* host_allocator) { host_allocator_ = host_allocator; }
-  bool limit_alloc(DeviceStats& stats, size_t alloc_size) {
-    auto reserved = stats.reserved_bytes[static_cast<size_t>(StatType::AGGREGATE)].current;
-    return (reserved + alloc_size) > limit_;
+
+  size_t device_limit(int64_t current, int device) {
+    size_t device_limit = limit_;
+    if (device_limit == 0) {
+      size_t available;
+      size_t capacity;
+      C10_CUDA_CHECK(cudaMemGetInfo(&available, &capacity));
+      // Reserve five percent of available memory for non-tensor uses
+      device_limit = static_cast<size_t>((available + current) * 0.95);
+    }
+    std::cout << "LMS allocation limit for device \"" << device
+              << "\" is " << (device_limit >> 20) << " MB\n";
+    return device_limit;
   }
 
-private:
+ private:
   bool enabled_;
   size_t limit_;
   at::Allocator* host_allocator_;
@@ -184,8 +195,7 @@ struct AllocParams {
     search_key(device, stream, size),
     pool(pool),
     alloc_size(alloc_size),
-    lms_enabled(lms->enabled()),
-    limit_alloc(lms_enabled && lms->limit_alloc(stats, alloc_size)),
+    lms(lms),
     block(nullptr),
     err(cudaSuccess) {}
 
@@ -196,8 +206,7 @@ struct AllocParams {
   Block search_key;
   BlockPool* pool;
   size_t alloc_size;
-  bool lms_enabled;
-  bool limit_alloc;
+  LMSSettings* lms;
   Block* block;
   StatTypes stat_types;
   AllocSource source;
@@ -271,14 +280,18 @@ class DeviceCachingAllocator {
   // outstanding cuda events
   std::deque<std::pair<cudaEvent_t, Block*>> cuda_events;
 
-  // set of reclaim candidates for LMS
+  // LMS: set of reclaim candidates
   at::LmsStorageList reclaim_list;
+
+  // LMS: hard allocation limit
+  size_t alloc_limit;
 
  public:
 
   DeviceCachingAllocator() :
       large_blocks(BlockComparator),
-      small_blocks(BlockComparator) {}
+      small_blocks(BlockComparator),
+      alloc_limit(0) {}
 
   // All public methods (except the above) acquire the allocator mutex.
   // Thus, do not call a public method from another public method.
@@ -302,18 +315,16 @@ class DeviceCachingAllocator {
       get_free_block(params, AllocSource::FREELIST)
       // 2. Trigger callbacks and retry search
       || (trigger_free_memory_callbacks(params) && get_free_block(params, AllocSource::FREELIST))
-      // 3. Attempt allocate (if not limited by lms settings)
-      || (!params.limit_alloc && alloc_block(params, false, AllocSource::CUDAMALLOC))
+      // 3. Attempt allocate
+      || alloc_block(params, AllocSource::CUDAMALLOC)
       // 4. If LMS enabled, try to reclaim inactive allocations
-      || (params.lms_enabled && try_lms_reclaim(params))
+      || (lms->enabled() && try_lms_reclaim(params))
       // 5. Free all non-split cached blocks and retry alloc.
-      || (free_cached_blocks() && alloc_block(params, true, AllocSource::CUDAMALLOC_RETRY));
+      || (free_cached_blocks() && alloc_block(params, AllocSource::CUDAMALLOC_RETRY));
 
     AT_ASSERT((!block_found && params.err != cudaSuccess) || params.block);
     if (!block_found) {
       if (params.err == cudaErrorMemoryAllocation) {
-        cudaGetLastError();  // clear CUDA error
-
         size_t device_free;
         size_t device_total;
         C10_CUDA_CHECK(cudaMemGetInfo(&device_free, &device_total));
@@ -450,6 +461,12 @@ class DeviceCachingAllocator {
   void emptyCache() {
     std::lock_guard<std::recursive_mutex> lock(mutex);
     free_cached_blocks();
+  }
+
+  /** recalculate allocation limit at next allocation request **/
+  void resetAllocLimit() {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    alloc_limit = 0;
   }
 
   /** Retrieves info (total size + largest block) of the memory cache **/
@@ -737,18 +754,32 @@ class DeviceCachingAllocator {
     return freed_memory;
   }
 
-  bool alloc_block(AllocParams& p, bool record_error, AllocSource source) {
+  bool alloc_block(AllocParams& p, AllocSource source) {
     size_t size = p.alloc_size;
+    bool isRetry = (source == AllocSource::CUDAMALLOC_RETRY);
     void* ptr;
-    cudaError_t err;
 
-    if (source == AllocSource::CUDAMALLOC_RETRY) {
+    if (isRetry) {
       stats.num_alloc_retries += 1;
     }
 
-    err = cudaMalloc(&ptr, size);
-    if (err != cudaSuccess) {
-      if (record_error) p.err = err; else cudaGetLastError();
+    // Enforce LMS limit
+    if (p.lms->enabled()) {
+      auto current = stats.reserved_bytes[static_cast<size_t>(StatType::AGGREGATE)].current;
+      if (alloc_limit == 0) {
+        // Initialize limit
+        alloc_limit = p.lms->device_limit(current, p.device());
+      }
+      if ((current + size) > alloc_limit) {
+        p.err = cudaErrorMemoryAllocation;
+        return false;
+      }
+    }
+
+    p.err = cudaMalloc(&ptr, size);
+    if (p.err != cudaSuccess) {
+      if (!isRetry || p.err == cudaErrorMemoryAllocation)
+        cudaGetLastError();  // clear CUDA error
       return false;
     }
 
@@ -1007,9 +1038,7 @@ class DeviceCachingAllocator {
       (reclaim_one(size, sync_event) && get_free_block(p, AllocSource::RECLAIM_ONE))
       // b. Reclaim fragments of suitable allocations
       || (reclaim_fragments(size, sync_event) && get_free_block(p, AllocSource::RECLAIM_FRAGMENTS))
-      // c. Attempt allocate (if not done earlier due to limit)
-      || (p.limit_alloc && alloc_block(p, false, AllocSource::CUDAMALLOC_OVER_LIMIT))
-      // d. Reclaim everything else
+      // c. Reclaim everything else
       || (reclaim_all(sync_event) && get_free_block(p, AllocSource::RECLAIM_ALL));
 
     C10_CUDA_CHECK(cudaEventDestroy(sync_event));
@@ -1092,6 +1121,12 @@ class THCCachingAllocator {
     int count = device_allocator.size();
     for (int i = 0; i < count; i++)
       device_allocator[i]->emptyCache();
+  }
+
+  void resetAllocLimit() {
+    int count = device_allocator.size();
+    for (int i = 0; i < count; i++)
+      device_allocator[i]->resetAllocLimit();
   }
 
   void* getBaseAllocation(void* ptr, size_t* outSize)
@@ -1246,7 +1281,10 @@ bool userEnabledLMS(void) {
 }
 
 void setUserLimitLMS(size_t limit) {
-  caching_allocator.lms_settings.set_limit(limit);
+  if (caching_allocator.lms_settings.limit() != limit) {
+    caching_allocator.lms_settings.set_limit(limit);
+    caching_allocator.resetAllocLimit();
+  }
 }
 
 size_t userLimitLMS(void) {

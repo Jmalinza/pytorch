@@ -291,8 +291,7 @@ PyObject * THCPModule_memoryStats(PyObject *_unused, PyObject *arg)
 
   const auto allocSourceArrayToDict = [](const AllocSourceArray& allocSourceArray) {
     const std::array<const char*, static_cast<size_t>(AllocSource::NUM_ALLOC_SOURCES)> allocSourceNames = {
-        "freelist", "cudamalloc", "reclaim_one", "reclaim_fragments", "cudamalloc_over_limit",
-        "reclaim_all", "cudamalloc_retry"
+        "freelist", "cudamalloc", "reclaim_one", "reclaim_fragments", "reclaim_all", "cudamalloc_retry"
     };
     py::dict dict;
     for (size_t i = 0; i < allocSourceNames.size(); ++i) {
