@@ -134,6 +134,7 @@ protected:
 
   void pagein_sync() {
     do_pagein_sync();
+    host_data_ptr_.clear();
     reclaimed_ = false;
   }
 
