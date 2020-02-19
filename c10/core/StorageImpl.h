@@ -123,6 +123,7 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
 
   // Returns the previous data_ptr
   at::DataPtr set_data_ptr(at::DataPtr&& data_ptr) {
+    if (lms_enabled()) lms_->ensure_data();
     std::swap(data_ptr_, data_ptr);
     return std::move(data_ptr);
   };
@@ -237,8 +238,6 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
   bool lms_pin()                       { return lms_enabled() && lms_->pin(); }
   bool lms_unpin()                     { return lms_->unpin(); }
   bool lms_reclaimed() const           { return lms_->reclaimed(); }
-  void lms_release_resources()         { lms_->release_resources(); }
-  void* allocation_ptr() const         { return data_ptr_.get(); }
 
   void lms_copy_reclaimed_data(void* dst, size_t size) {
     lms_->copy_reclaimed_data(dst, size);
@@ -253,7 +252,9 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
   // local to process cuda memory allocation
   bool received_cuda_;
   Allocator* allocator_;
+
   std::unique_ptr<LmsStorageImpl> lms_;
+  friend class LmsStorageImpl;  // data_ptr_ access
 };
 
 // StorageImpl accessors for LMS to avoid circular depencencies
@@ -269,11 +270,12 @@ inline Device LmsStorageImpl::device() const {
   return storage_->device();
 }
 
-inline void* LmsStorageImpl::ptr() const {
-  return storage_->allocation_ptr();
+inline void* LmsStorageImpl::device_ptr() const {
+  return storage_->data_ptr_.get();
 }
 
-inline at::DataPtr LmsStorageImpl::set_data_ptr(at::DataPtr&& data_ptr) {
-  return storage_->set_data_ptr(std::move(data_ptr));
+inline at::DataPtr LmsStorageImpl::set_device_ptr(at::DataPtr&& data_ptr) {
+  std::swap(storage_->data_ptr_, data_ptr);
+  return std::move(data_ptr);
 }
 } // namespace c10

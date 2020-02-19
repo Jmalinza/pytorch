@@ -8,6 +8,7 @@
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <bitset>
+#include <condition_variable>
 #include <deque>
 #include <iterator>
 #include <map>
@@ -17,7 +18,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <ostream>
 
 namespace c10 {
 
@@ -178,9 +178,53 @@ struct LMSSettings {
       // Reserve five percent of available memory for non-tensor uses
       device_limit = static_cast<size_t>((available + current) * 0.95);
     }
-    std::cout << "LMS allocation limit for device \"" << device
+    std::cout << "LMS: allocation limit for device \"" << device
               << "\" is " << (device_limit >> 20) << " MB\n";
     return device_limit;
+  }
+
+  // Internal debug settings
+  static int verbosity;
+  static bool speculative_pageout;
+
+  static void init_debug_settings() {
+    auto var = std::getenv("PYTORCH_LMS_DEBUG");
+    if (var) {
+      const char option_delim = ',';
+      const char key_split = '=';
+      auto s = std::string(var);
+      while (true) {
+        auto delim = s.find(option_delim);
+        auto option = (delim == std::string::npos) ? s : s.substr(0, delim);
+        auto split = option.find(key_split);
+        if (split != std::string::npos) {
+          auto key = option.substr(0, split);
+          auto val = option.substr(split + 1);
+          if (key == "verbosity") {
+            verbosity = std::stoi(val);
+          } else if (key == "speculative-pageout") {
+            if (val == "off") {
+              speculative_pageout = false;
+            }
+          }
+        }
+        if (delim == std::string::npos)
+          break;
+        s.erase(0, delim + 1);
+      }
+      std::cout << "LMS: verbosity" << key_split << verbosity << "\n"
+                << "LMS: speculative-pageout" << key_split
+                << (speculative_pageout ? "on " : "off") << "\n";
+    }
+  }
+
+  static void debug_log(int level, LmsStorageImpl* lmsStorage, const char* message) {
+    if (verbosity > level) {
+      if (lmsStorage)
+        std::cout << "LMS: " << (void*)lmsStorage << " " << message << "\n";
+      else
+        std::cout << "LMS: " << message << "\n";
+    }
   }
 
  private:
@@ -188,6 +232,9 @@ struct LMSSettings {
   size_t limit_;
   at::Allocator* host_allocator_;
 };
+
+int LMSSettings::verbosity = 0;
+bool LMSSettings::speculative_pageout = true;
 
 struct AllocParams {
   AllocParams(int device, size_t size, cudaStream_t stream, BlockPool* pool, size_t alloc_size,
@@ -213,47 +260,113 @@ struct AllocParams {
   cudaError_t err;
 };
 
+class LMSReclaimHistory {
+ public:
+  void record(bool reclaimed) {
+    data_ <<= 1;
+    if (reclaimed)
+      data_ |= 1;
+    n_++;
+  }
+  void reset() {
+    prev_ = data_;
+    prev_n_ = n_;
+    data_ = 0;
+    n_ = 0;
+  }
+  int predictions_remaining() const { return prev_n_ - n_; }
+  bool predict() {
+    int remain = predictions_remaining();
+    return (remain > 0) && ((prev_ >> (remain - 1)) & 1) && ((prev_ >> remain) == data_);
+  }
+  uint32_t data() const { return data_; }
+  uint32_t prev() const { return prev_; }
+
+ private:
+  uint32_t data_ = 0;
+  uint32_t prev_;
+  uint16_t n_ = 0;
+  uint16_t prev_n_ = 0;
+};
+
 #define LMS_INVALID_STREAM ((cudaStream_t)-1)
 
-struct CudaLmsStorageImpl : public at::LmsStorageImpl {
+class CudaLmsStorageImpl : public at::LmsStorageImpl {
+
+ public:
+
   CudaLmsStorageImpl(at::StorageImpl* storage);
-  ~CudaLmsStorageImpl() {}
+  ~CudaLmsStorageImpl();
 
   Block* block() const {
     return block_;
   }
 
- protected:
-  void reclaim_list_add();
-  bool reclaim_list_remove();
-
-  cudaStream_t stream() const {
-    AT_ASSERT(stream_ != LMS_INVALID_STREAM);
-    return stream_;
-  }
-
-  void do_pagein(void* dst, void* src, size_t size) {
-    C10_CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, stream()));
-  }
-
-  void do_pagein_sync() {
-    C10_CUDA_CHECK(cudaStreamSynchronize(stream()));
-  }
-
-  void do_pageout(void* dst, void* src, size_t size, at::LMSSyncEvent_t sync_event) {
-    if (stream_ == LMS_INVALID_STREAM) {
-      stream_ = cuda::getLMSCUDAStream().stream();
+  void assign_streams(cudaStream_t out, cudaStream_t in) {
+    if (pageout_stream_ == LMS_INVALID_STREAM) {
+      TORCH_INTERNAL_ASSERT(out != LMS_INVALID_STREAM);
+      pageout_stream_ = out;
+      pagein_stream_ = in;
+      compute_stream_ = block_->stream;
     }
-    C10_CUDA_CHECK(cudaStreamWaitEvent(stream(), (cudaEvent_t)sync_event, 0));
-    C10_CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost, stream()));
   }
 
-  void do_pageout_sync() {
-    C10_CUDA_CHECK(cudaStreamSynchronize(stream()));
+  // Allows speculative pageout when set to a unique Id that persists across iterations
+  void SetGraphId(int64_t id, int device) {
+    graph_id_ = id;
+    device_ = device;
   }
+
+  bool GraphId(int64_t* id) const {
+    if (graph_id_ == 0) return false;
+    *id = graph_id_;
+    return true;
+  }
+
+ protected:
+
+  bool reclaim_list_add() override;
+  bool reclaim_list_remove() override;
+  void do_sync(bool reclaim) override;
+
+  void do_pageout(void* dst, const void* src, size_t size, bool speculative) override {
+    LMSSettings::debug_log(1, this, speculative ? "pageout (speculative)" : "pageout (reclaim)");
+    swap(dst, src, size, cudaMemcpyDeviceToHost, pageout_stream_);
+  }
+
+  void do_pagein(void* dst, const void* src, size_t size, bool pin) override {
+    LMSSettings::debug_log(1, this, pin ? "pagein (pin)" : "pagein (access)");
+    swap(dst, src, size, cudaMemcpyHostToDevice, pagein_stream_);
+  }
+
+  void debug_log(int level, const char* message) override {
+    LMSSettings::debug_log(level, this, message);
+  }
+
+ private:
+  void swap(void* dst, const void* src, size_t size, enum cudaMemcpyKind kind, cudaStream_t stream) {
+    TORCH_INTERNAL_ASSERT(stream != LMS_INVALID_STREAM);
+
+    cudaEvent_t event = create_event();
+    // Synchronize swap stream with compute stream
+    C10_CUDA_CHECK(cudaEventRecord(event, compute_stream_));
+    C10_CUDA_CHECK(cudaStreamWaitEvent(stream, event, 0));
+    // Queue copy
+    C10_CUDA_CHECK(cudaMemcpyAsync(dst, src, size, kind, stream));
+    // Record event to wait on copy completion
+    C10_CUDA_CHECK(cudaEventRecord(event, stream));
+    event_ = event;
+  }
+
+  cudaEvent_t create_event();
 
   Block* block_; // cache block pointer for use while on reclaim list
-  cudaStream_t stream_;
+  int64_t graph_id_;
+  int device_;
+  cudaStream_t compute_stream_;
+  cudaStream_t pageout_stream_;
+  cudaStream_t pagein_stream_;
+  cudaEvent_t event_;
 };
 
 } // namespace
@@ -277,28 +390,47 @@ class DeviceCachingAllocator {
   // allocated or in use by a stream
   std::unordered_set<Block*> active_blocks;
 
+  // available cuda events
+  std::vector<cudaEvent_t> cuda_event_cache;
+
   // outstanding cuda events
   std::deque<std::pair<cudaEvent_t, Block*>> cuda_events;
 
+  // LMS: dedicated streams for swapping
+  cudaStream_t pageout_stream = LMS_INVALID_STREAM;
+  cudaStream_t pagein_stream = LMS_INVALID_STREAM;
+
   // LMS: set of reclaim candidates
   at::LmsStorageList reclaim_list;
+  std::condition_variable_any reclaim_cv;
+  int reclaim_waiter = 0;
+
+  // LMS: speculative pageout counters and history
+  int reclaim_count = 0;
+  int total_storage_count = 0;
+  std::unordered_map<int64_t, LMSReclaimHistory> reclaim_history;
 
   // LMS: hard allocation limit
-  size_t alloc_limit;
+  size_t alloc_limit = 0;
+
+  enum class ReclaimStatus {
+    kSuccess,
+    kUnavailable,
+    kRetry,
+  };
 
  public:
 
   DeviceCachingAllocator() :
       large_blocks(BlockComparator),
-      small_blocks(BlockComparator),
-      alloc_limit(0) {}
+      small_blocks(BlockComparator) {}
 
   // All public methods (except the above) acquire the allocator mutex.
   // Thus, do not call a public method from another public method.
 
   Block* malloc(int device, size_t size, cudaStream_t stream, LMSSettings* lms)
   {
-    std::lock_guard<std::recursive_mutex> lock(mutex);
+    std::unique_lock<std::recursive_mutex> lock(mutex);
 
     // process outstanding cudaEvents
     process_events();
@@ -318,11 +450,11 @@ class DeviceCachingAllocator {
       // 3. Attempt allocate
       || alloc_block(params, AllocSource::CUDAMALLOC)
       // 4. If LMS enabled, try to reclaim inactive allocations
-      || (lms->enabled() && try_lms_reclaim(params))
+      || (lms->enabled() && reclaim_block(params, lock))
       // 5. Free all non-split cached blocks and retry alloc.
       || (free_cached_blocks() && alloc_block(params, AllocSource::CUDAMALLOC_RETRY));
 
-    AT_ASSERT((!block_found && params.err != cudaSuccess) || params.block);
+    TORCH_INTERNAL_ASSERT((!block_found && params.err != cudaSuccess) || params.block);
     if (!block_found) {
       if (params.err == cudaErrorMemoryAllocation) {
         size_t device_free;
@@ -364,7 +496,7 @@ class DeviceCachingAllocator {
 
     Block* block = params.block;
     Block* remaining = nullptr;
-    AT_ASSERT(block);
+    TORCH_INTERNAL_ASSERT(block);
 
     const bool already_split = block->is_split();
     if (should_split(block, size)) {
@@ -578,9 +710,9 @@ class DeviceCachingAllocator {
     }
   }
 
-  void reclaim_list_add(LmsStorageImpl* lmsStorage) {
+  bool reclaim_list_add(CudaLmsStorageImpl* lmsStorage) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
-    Block* block = static_cast<CudaLmsStorageImpl*>(lmsStorage)->block();
+    Block* block = lmsStorage->block();
 
     StatTypes stat_types;
     stat_types[static_cast<size_t>(StatType::AGGREGATE)] = true;
@@ -589,25 +721,43 @@ class DeviceCachingAllocator {
     update_stat_array(stats.pinned_bytes, -block->size, stat_types);
 
     lmsStorage->list_add(&reclaim_list);
+    reclaim_count++;
+
+    bool reclaim_predicted = predict_reclaim(lmsStorage);
+    if (reclaim_predicted) {
+      lmsStorage->assign_streams(pageout_stream, pagein_stream);
+    }
+
+    if (reclaim_waiter)
+      reclaim_cv.notify_all();
+
+    return reclaim_predicted;
   }
 
-  bool reclaim_list_remove(LmsStorageImpl* lmsStorage) {
+  bool reclaim_list_remove(CudaLmsStorageImpl* lmsStorage) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
-    return reclaim_list_remove_internal(lmsStorage);
+    return reclaim_list_remove_internal(lmsStorage, false /* !reclaimed */);
+  }
+
+  void storage_count_decrement() {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    total_storage_count--;
   }
 
   void reclaimInactive() {
     std::lock_guard<std::recursive_mutex> lock(mutex);
+    reclaim_all();
+  }
 
-    if (!reclaim_list.empty()) {
-      cudaStream_t stream = cuda::getCurrentCUDAStream().stream();
-      cudaEvent_t sync_event;
+  cudaEvent_t create_event() {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    return create_event_internal();
+  }
 
-      C10_CUDA_CHECK(cudaEventCreate(&sync_event));
-      C10_CUDA_CHECK(cudaEventRecord(sync_event, stream));
-      reclaim_all(sync_event);
-      C10_CUDA_CHECK(cudaEventDestroy(sync_event));
-    }
+  void transition_complete(CudaLmsStorageImpl* lmsStorage, cudaEvent_t event, bool reclaim) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    free_event_internal(event);
+    LMSSettings::debug_log(2, lmsStorage, reclaim ? "transition complete (reclaim)" : "transition complete");
   }
 
  private:
@@ -625,7 +775,7 @@ class DeviceCachingAllocator {
   /** moves a block into a pool of cached free blocks */
   void free_block(Block* block)
   {
-    AT_ASSERT(!block->allocated && block->event_count == 0);
+    TORCH_INTERNAL_ASSERT(!block->allocated && block->event_count == 0);
 
     size_t original_block_size = block->size;
 
@@ -828,6 +978,21 @@ class DeviceCachingAllocator {
     }
   }
 
+  cudaEvent_t create_event_internal() {
+    cudaEvent_t event;
+    if (cuda_event_cache.empty()) {
+      C10_CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    } else {
+      event = cuda_event_cache.back();
+      cuda_event_cache.pop_back();
+    }
+    return event;
+  }
+
+  void free_event_internal(cudaEvent_t event) {
+    cuda_event_cache.push_back(event);
+  }
+
   void synchronize_and_free_events() {
     // Synchronize on outstanding events and then free associated blocks.
 
@@ -836,7 +1001,7 @@ class DeviceCachingAllocator {
       Block* block = e.second;
 
       C10_CUDA_CHECK(cudaEventSynchronize(event));
-      C10_CUDA_CHECK(cudaEventDestroy(event));
+      free_event_internal(event);
 
       block->event_count--;
       if (block->event_count == 0) {
@@ -857,8 +1022,7 @@ class DeviceCachingAllocator {
     for (auto it = streams.begin(); it != streams.end(); ++it) {
       C10_CUDA_CHECK(cudaSetDevice(it->device_index()));
 
-      cudaEvent_t event;
-      C10_CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+      cudaEvent_t event = create_event_internal();
       C10_CUDA_CHECK(cudaEventRecord(event, it->stream()));
 
       block->event_count++;
@@ -889,7 +1053,7 @@ class DeviceCachingAllocator {
         C10_CUDA_CHECK(err);
       }
 
-      C10_CUDA_CHECK(cudaEventDestroy(event));
+      free_event_internal(event);
 
       block->event_count--;
       if (block->event_count == 0) {
@@ -911,37 +1075,79 @@ class DeviceCachingAllocator {
     }
   }
 
-  bool reclaim_list_remove_internal(LmsStorageImpl* lmsStorage, bool reclaimed = false) {
+  bool reclaim_list_remove_internal(CudaLmsStorageImpl* lmsStorage, bool reclaimed) {
     if (!lmsStorage->list_remove())
       return false;
+    reclaim_count--;
 
-    Block* block = static_cast<CudaLmsStorageImpl*>(lmsStorage)->block();
+    Block* block = lmsStorage->block();
 
     StatTypes stat_types;
     stat_types[static_cast<size_t>(StatType::AGGREGATE)] = true;
     stat_types[static_cast<size_t>(get_stat_type_for_size(block->size))] = true;
     update_stat_array(stats.pinned, 1, stat_types);
     update_stat_array(stats.pinned_bytes, block->size, stat_types);
+
+    record_reclaim(lmsStorage, reclaimed);
+
     if (reclaimed) {
       stats.reclaimed += 1;
       stats.reclaimed_bytes += lmsStorage->capacity();
+      // Free pointer
+      raw_delete(block->ptr);
     }
+
+    if (reclaim_waiter)
+      reclaim_cv.notify_all();
 
     return true;
   }
 
-  bool reclaim_one(size_t size, cudaEvent_t sync_event) {
-    LmsStorageImpl *best = nullptr;
+  ReclaimStatus reclaim_one_internal(CudaLmsStorageImpl* lmsStorage,
+                                     at::LmsStorageList* iodone_queue) {
+    bool synchronous = (iodone_queue == nullptr);
+
+    lmsStorage->assign_streams(pageout_stream, pagein_stream);
+    if (!lmsStorage->reclaim(synchronous)) {
+      // Pageout attempt was not successful. Wait on reclaim list notification and retry.
+      LMSSettings::debug_log(0, lmsStorage, "contention during reclaim");
+      return ReclaimStatus::kRetry;
+    }
+
+    if (synchronous) {
+      reclaim_list_remove_internal(lmsStorage, true /* reclaimed */);
+    } else {
+      lmsStorage->list_remove();
+      lmsStorage->list_add(iodone_queue);
+    }
+    return ReclaimStatus::kSuccess;
+  }
+
+  void process_reclaim_sync(at::LmsStorageList* iodone_queue) {
+    // Note: This path doesn't rely on reclaiming any single tensor --
+    // so errors from reclaim_sync() are not propagated back.
+    while (!iodone_queue->empty()) {
+      auto lmsStorage = static_cast<CudaLmsStorageImpl*>(iodone_queue->head()->elem());
+      bool reclaimed = lmsStorage->reclaim_sync();
+      if (!reclaimed) {
+        LMSSettings::debug_log(0, lmsStorage, "contention during reclaim_sync");
+      }
+      reclaim_list_remove_internal(lmsStorage, reclaimed);
+    }
+  }
+
+  ReclaimStatus reclaim_one(size_t size) {
+    CudaLmsStorageImpl *best = nullptr;
     size_t best_size = ULONG_MAX;
 
     if (!reclaim_list.empty()) {
       auto hook = reclaim_list.head();
       auto end = reclaim_list.terminator();
       do {
-        LmsStorageImpl *lmsStorage = hook->elem();
+        auto lmsStorage = static_cast<CudaLmsStorageImpl*>(hook->elem());
         hook = hook->next();
 
-        Block* block = static_cast<CudaLmsStorageImpl*>(lmsStorage)->block();
+        Block* block = lmsStorage->block();
         if (block->size >= size && block->size < best_size) {
           best = lmsStorage;
           best_size = block->size;
@@ -954,96 +1160,161 @@ class DeviceCachingAllocator {
     }
 
     if (best == nullptr)
-      return false;
+      return ReclaimStatus::kUnavailable;
 
-    reclaim_list_remove_internal(best, true);
-    best->pageout(sync_event);
-    best->pageout_sync();
-
-    return true;
+    return reclaim_one_internal(best, nullptr /* synchronous */);
   }
 
-  static inline void process_pageout_sync(at::LmsStorageList* iodone_queue) {
-    while (!iodone_queue->empty()) {
-      auto hook = iodone_queue->head();
-      LmsStorageImpl *lmsStorage = hook->elem();
-      lmsStorage->pageout_sync(iodone_queue);
-    }
-  }
-
-  bool reclaim_fragments(size_t size, cudaEvent_t sync_event) {
-    at::LmsStorageList iodone_queue;
-    size_t alloc_size;
-    int count = 0;
+  ReclaimStatus reclaim_fragments(size_t size) {
+    ReclaimStatus status = ReclaimStatus::kUnavailable;
 
     if (!reclaim_list.empty()) {
+      LMSSettings::debug_log(1, nullptr, "begin reclaim_fragments");
       auto hook = reclaim_list.head();
       auto end = reclaim_list.terminator();
+      at::LmsStorageList iodone_queue;
       do {
-        LmsStorageImpl *lmsStorage = hook->elem();
+        auto lmsStorage = static_cast<CudaLmsStorageImpl*>(hook->elem());
         hook = hook->next();
 
-        Block* block = static_cast<CudaLmsStorageImpl*>(lmsStorage)->block();
+        Block* block = lmsStorage->block();
+        size_t alloc_size;
         getBaseAllocation(block, &alloc_size);
         if (alloc_size >= size) {
-          reclaim_list_remove_internal(lmsStorage, true);
-          lmsStorage->pageout(sync_event, &iodone_queue);
-          count++;
+          status = reclaim_one_internal(lmsStorage, &iodone_queue);
+          if (status != ReclaimStatus::kSuccess)
+            break;
         }
       } while (hook != end);
+
+      process_reclaim_sync(&iodone_queue);
+      LMSSettings::debug_log(1, nullptr, "end reclaim_fragments");
     }
 
-    if (count == 0)
-      return false;
-
-    process_pageout_sync(&iodone_queue);
-    return true;
+    return status;
   }
 
-  bool reclaim_all(cudaEvent_t sync_event) {
-    at::LmsStorageList iodone_queue;
-    int count = 0;
+  ReclaimStatus reclaim_all() {
+    ReclaimStatus status = ReclaimStatus::kUnavailable;
 
     if (!reclaim_list.empty()) {
+      LMSSettings::debug_log(1, nullptr, "begin reclaim_all");
       auto hook = reclaim_list.head();
       auto end = reclaim_list.terminator();
+      at::LmsStorageList iodone_queue;
       do {
-        LmsStorageImpl *lmsStorage = hook->elem();
+        auto lmsStorage = static_cast<CudaLmsStorageImpl*>(hook->elem());
         hook = hook->next();
 
-        reclaim_list_remove_internal(lmsStorage, true);
-        lmsStorage->pageout(sync_event, &iodone_queue);
-        count++;
+        status = reclaim_one_internal(lmsStorage, &iodone_queue);
+        if (status != ReclaimStatus::kSuccess)
+          break;
       } while (hook != end);
+
+      process_reclaim_sync(&iodone_queue);
+      LMSSettings::debug_log(1, nullptr, "end reclaim_all");
     }
 
-    if (count == 0)
-      return false;
-
-    process_pageout_sync(&iodone_queue);
-    return true;
+    return status;
   }
 
-  bool try_lms_reclaim(AllocParams& p) {
+  bool reclaim_block(AllocParams& p, std::unique_lock<std::recursive_mutex>& lock) {
     size_t size = p.size();
-    cudaStream_t stream = p.stream();
-    cudaEvent_t sync_event;
 
-    AT_ASSERT(stream == cuda::getCurrentCUDAStream().stream());
-    C10_CUDA_CHECK(cudaEventCreate(&sync_event));
-    C10_CUDA_CHECK(cudaEventRecord(sync_event, stream));
+    if (pageout_stream == LMS_INVALID_STREAM) {
+      pageout_stream = cuda::getLMSCUDAStream().stream();
+      pagein_stream = cuda::getLMSCUDAStream().stream();
+    }
 
-    bool found =
-      // a. Search reclaim list for a suitable inactive allocation
-      (reclaim_one(size, sync_event) && get_free_block(p, AllocSource::RECLAIM_ONE))
-      // b. Reclaim fragments of suitable allocations
-      || (reclaim_fragments(size, sync_event) && get_free_block(p, AllocSource::RECLAIM_FRAGMENTS))
-      // c. Reclaim everything else
-      || (reclaim_all(sync_event) && get_free_block(p, AllocSource::RECLAIM_ALL));
+    while (!reclaim_list.empty()) {
+      // Reclaim a single suitable inactive allocation
+      auto status = reclaim_one(size);
+      if (status == ReclaimStatus::kSuccess) {
+        if (get_free_block(p, AllocSource::RECLAIM_ONE)) {
+          break;
+        }
+        LMSSettings::debug_log(0, nullptr, "reclaim_one ineffective");
+        continue;
+      }
+      if (status == ReclaimStatus::kUnavailable) {
+        // Reclaim fragments of suitable allocations
+        status = reclaim_fragments(size);
+        if (status == ReclaimStatus::kSuccess) {
+          if (get_free_block(p, AllocSource::RECLAIM_FRAGMENTS)) {
+            break;
+          }
+          status = ReclaimStatus::kUnavailable;
+        }
+      }
+      if (status == ReclaimStatus::kUnavailable) {
+        // Reclaim everything to give free_cached_blocks the best chance of success.
+        status = reclaim_all();
+        if (status == ReclaimStatus::kSuccess) {
+          if (get_free_block(p, AllocSource::RECLAIM_ALL)) {
+            break;
+          }
+          status = ReclaimStatus::kUnavailable;
+        }
+      }
+      if (status == ReclaimStatus::kUnavailable) {
+        TORCH_INTERNAL_ASSERT(reclaim_list.empty());
+        break;
+      }
 
-    C10_CUDA_CHECK(cudaEventDestroy(sync_event));
+      TORCH_INTERNAL_ASSERT(status == ReclaimStatus::kRetry);
+      reclaim_waiter++;
+      reclaim_cv.wait(lock);
+      reclaim_waiter--;
 
-    return found;
+      // The set of completed events and unallocated cached blocks may have changed.
+      process_events();
+      if (get_free_block(p, AllocSource::FREELIST)) {
+        break;
+      }
+    } // end while reclaim list not empty
+
+    return (p.block != nullptr);
+  }
+
+  bool predict_reclaim(CudaLmsStorageImpl* lmsStorage) {
+    if (!LMSSettings::speculative_pageout)
+      return false;
+
+    int64_t id;
+    bool first_time = !lmsStorage->GraphId(&id);
+    if (first_time) {
+      // Construct a pseudo unique Id
+      Block* block = lmsStorage->block();
+      int64_t total_count = ++total_storage_count;
+      id = (block->size << 24) + (total_count << 12) + reclaim_count;
+      lmsStorage->SetGraphId(id, block->device);
+    }
+    LMSReclaimHistory& hist = reclaim_history[id];
+    if (first_time)
+      hist.reset();
+    return hist.predict();
+  }
+
+  void record_reclaim(CudaLmsStorageImpl* lmsStorage, bool reclaimed) {
+    if (!LMSSettings::speculative_pageout)
+      return;
+
+    int64_t id;
+    bool has_id = lmsStorage->GraphId(&id);
+    TORCH_INTERNAL_ASSERT(has_id);
+    LMSReclaimHistory& hist = reclaim_history[id];
+    if (LMSSettings::verbosity) {
+      bool no_hist = (reclaimed && (hist.predictions_remaining() <= 0));
+      if (no_hist || (hist.predict() != reclaimed)) {
+        std::cout << "LMS: " << (void*)lmsStorage << " page-out prediction "
+                  << (reclaimed ? (no_hist ? "<n/a>" : "miss ") : "wrong")
+                  << " id=" << (void*)id
+                  << " size=" << lmsStorage->block()->size
+                  << "\n";
+      }
+    }
+
+    hist.record(reclaimed);
   }
 };
 
@@ -1110,7 +1381,7 @@ class THCCachingAllocator {
     if (!ptr) {
       return;
     }
-    Block* block = get_allocated_block(ptr, true);
+    Block* block = get_allocated_block(ptr, true /* remove */);
     if (!block) {
       AT_ERROR("invalid device pointer: ", ptr);
     }
@@ -1176,17 +1447,39 @@ THCCachingAllocator caching_allocator;
 
 CudaLmsStorageImpl::CudaLmsStorageImpl(at::StorageImpl* storage) :
   at::LmsStorageImpl(storage, caching_allocator.lms_settings.host_allocator()),
-  block_(nullptr), stream_(LMS_INVALID_STREAM) {}
+  block_(nullptr), graph_id_(0),
+  pageout_stream_(LMS_INVALID_STREAM), pagein_stream_(LMS_INVALID_STREAM) {}
 
-void CudaLmsStorageImpl::reclaim_list_add() {
-  if (capacity() > 0) {
-    block_ = caching_allocator.get_allocated_block(ptr());
-    caching_allocator.device_allocator[device().index()]->reclaim_list_add(this);
+CudaLmsStorageImpl::~CudaLmsStorageImpl() {
+  if (graph_id_ != 0) {
+    caching_allocator.device_allocator[device_]->storage_count_decrement();
   }
+  release_resources();
+}
+
+bool CudaLmsStorageImpl::reclaim_list_add() {
+  if (capacity() == 0 || !device_ptr())
+    return false;
+
+  Block* block = caching_allocator.get_allocated_block(device_ptr());
+  if (!block)
+    return false;
+
+  block_ = block;
+  return caching_allocator.device_allocator[device().index()]->reclaim_list_add(this);
 }
 
 bool CudaLmsStorageImpl::reclaim_list_remove() {
   return caching_allocator.device_allocator[device().index()]->reclaim_list_remove(this);
+}
+
+inline cudaEvent_t CudaLmsStorageImpl::create_event() {
+  return caching_allocator.device_allocator[device().index()]->create_event();
+}
+
+void CudaLmsStorageImpl::do_sync(bool reclaim) {
+  C10_CUDA_CHECK(cudaEventSynchronize(event_));
+  caching_allocator.device_allocator[device().index()]->transition_complete(this, event_, reclaim);
 }
 
 static void CudaCachingDeleter(void* ptr) {
@@ -1209,7 +1502,7 @@ struct CudaCachingAllocator : public Allocator {
   DeleterFnPtr raw_deleter() const override {
     return &CudaCachingDeleter;
   }
-  at::LmsStorageImpl* AsLmsStorage(at::StorageImpl* storage) const {
+  at::LmsStorageImpl* AsLmsStorage(at::StorageImpl* storage) const override {
     return caching_allocator.lms_settings.enabled() ? new CudaLmsStorageImpl(storage) : nullptr;
   }
 };
@@ -1222,6 +1515,7 @@ Allocator* get(void)
 }
 
 void init(int device_count, at::Allocator* host_allocator) {
+  LMSSettings::init_debug_settings();
   caching_allocator.init(device_count, host_allocator);
 }
 

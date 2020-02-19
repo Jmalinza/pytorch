@@ -74,7 +74,7 @@ static std::array<LeakyStreamInternals, kStreamsPerPool>
     high_priority_streams[C10_COMPILE_TIME_MAX_GPUS];
 
 // LMS streams
-static constexpr unsigned int kLMSFlags = cudaStreamDefault;
+static constexpr unsigned int kLMSFlags = cudaStreamNonBlocking;
 static std::once_flag device_flags_lms[C10_COMPILE_TIME_MAX_GPUS];
 static std::atomic<uint32_t> lms_counters[C10_COMPILE_TIME_MAX_GPUS];
 static std::array<LeakyStreamInternals, kStreamsPerPool>

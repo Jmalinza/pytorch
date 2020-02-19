@@ -28,11 +28,6 @@ void THCStorage_resize(THCState *state, THCStorage *self, ptrdiff_t size)
 
   size_t itemsize = self->itemsize();
 
-  if (self->lms_enabled()) {
-    THAssert(!self->lms_reclaimed());
-    self->lms_release_resources();
-  }
-
   if(size == 0)
   {
     self->set_data_ptr(at::DataPtr(nullptr, at::Device(at::DeviceType::CUDA, device)));

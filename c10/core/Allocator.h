@@ -125,7 +125,7 @@ inline bool operator!=(std::nullptr_t, const DataPtr& dp) noexcept {
 }
 
 struct StorageImpl;
-struct LmsStorageImpl;
+class LmsStorageImpl;
 
 // Note [raw_allocate/raw_deallocate and Thrust]
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
